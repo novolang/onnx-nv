@@ -1,0 +1,247 @@
+// onnxopset.nv — the operator-set table, carried as data.
+//
+// AN OPERATOR IS NOT ONE THING; IT IS A SEQUENCE OF VERSIONS
+//
+// `Squeeze` took its axes as an ATTRIBUTE up to opset 12 and as an
+// INPUT from opset 13.  `Softmax`'s `axis` defaulted to 1 before opset
+// 13 and to -1 after it.  `Resize` changed its input list three times.
+// Every one of those is the same `op_type` string, and a checker that
+// looked only at the string would pass a model that no runtime can
+// load.
+//
+// So the table is keyed by domain, op type AND version: `schema_for`
+// takes the version the model imported and answers the schema that was
+// in force, which is the one with the largest `since_version` no
+// greater than it.
+//
+// WHAT THE TABLE CARRIES AND WHAT IT DOES NOT
+//
+// It carries what can be checked from the graph alone: the arity, which
+// inputs and outputs are optional, which are variadic, and at which
+// version each spelling came in.  It does NOT carry type constraints,
+// shape inference rules or reference implementations — those are the
+// operator's semantics, they are the majority of the ONNX
+// specification's bulk, and a package that shipped them would be
+// shipping a runtime.
+//
+// The division is exactly the one the row draws: this package reads
+// and checks a model, and `libonnxruntime-sys` runs it.
+
+// What one operator looked like at one version.
+//
+// ```novo
+// use onnxopset
+//
+// fn main() [io]
+//     match onnxopset.schema_for("", "Conv", 17)
+//         Some(s) => println("${s.min_input}")   // 2
+//         None    => println("not in the table")
+// ```
+pub struct OnnxOpSchema
+    // The domain: `""` for the default set.
+    domain: Str
+    // The operator: `Conv`, `MatMul`, `If`.
+    op_type: Str
+    // The version at which THIS spelling of the operator came in.  A
+    // model importing a version below it is using an operator that did
+    // not exist yet.
+    since_version: Int
+    // The fewest inputs a node may have.  Counts SUPPLIED inputs, so
+    // an omitted optional input in the middle of the list does not
+    // count.
+    min_input: Int
+    // The most it may have, or `-1` when the last input is variadic —
+    // `Concat`, `Sum`, `Max`.
+    max_input: Int
+    // The fewest outputs.
+    min_output: Int
+    // The most, or `-1` when variadic — `Split`.
+    max_output: Int
+    // The names of the attributes the operator accepts, in the
+    // specification's order.
+    attributes: [Str]
+    // Which of those the operator REQUIRES.  An operator whose
+    // required attribute is missing cannot run, and it is the one
+    // attribute fault worth reporting as a fault rather than a
+    // difference.
+    required_attributes: [Str]
+    // Whether this version is deprecated.  `Upsample` after opset 10
+    // is the example: still loadable, replaced by `Resize`, and worth
+    // telling a caller about before it builds on one.
+    deprecated: Bool
+
+// The largest opset version of the default domain this table knows.
+//
+// A model importing a larger one is not refused — the graph still
+// reads — but `onnxcheck` reports that the table cannot speak for it.
+pub const ONNX_MAX_OPSET = 21
+
+// The version of `ir_version` this package understands.
+pub const ONNX_MAX_IR_VERSION = 10
+
+// The schema in force for an operator at a version, or `None`.
+//
+// The one with the largest `since_version` no greater than `version`.
+// `None` when the table does not know the operator at all, or knows it
+// only at versions above `version` — which is a model using an
+// operator that did not exist yet, and is what `onnxcheck` reports.
+//
+// ```novo
+// use onnxopset
+//
+// fn main() [io]
+//     match onnxopset.schema_for("", "Squeeze", 11)
+//         Some(s) => println("${s.min_input}")   // 1 — axes was an attribute then
+//         None    => println("not in the table")
+// ```
+pub fn schema_for(domain: Str, op_type: Str, version: Int) -> ?OnnxOpSchema []
+    todo("onnx-nv.onnxopset.schema_for")
+
+// Every version of an operator the table carries, oldest first.
+//
+// What a converter walks to find the step between two opsets.
+//
+// ```novo
+// use std.list
+// use onnxopset
+//
+// fn main() [io]
+//     println("${list.len(onnxopset.versions_of("", "Squeeze")) >= 2}")   // true
+// ```
+pub fn versions_of(domain: Str, op_type: Str) -> [OnnxOpSchema] []
+    todo("onnx-nv.onnxopset.versions_of")
+
+// The version at which an operator first appeared, or `None`.
+//
+// ```novo
+// use onnxopset
+//
+// fn main() [io]
+//     match onnxopset.introduced_at("", "Conv")
+//         Some(v) => println("${v}")            // 1
+//         None    => println("not in the table")
+// ```
+pub fn introduced_at(domain: Str, op_type: Str) -> ?Int []
+    todo("onnx-nv.onnxopset.introduced_at")
+
+// Whether the table knows an operator in a domain at all.
+//
+// ```novo
+// use onnxopset
+//
+// fn main() [io]
+//     println("${onnxopset.is_known("", "Conv")}")            // true
+//     println("${onnxopset.is_known("", "NotAnOperator")}")   // false
+// ```
+pub fn is_known(domain: Str, op_type: Str) -> Bool []
+    todo("onnx-nv.onnxopset.is_known")
+
+// Whether a supplied-input count fits a schema's arity.
+//
+// Variadic when `max_input` is `-1`, in which case only the minimum
+// is checked.
+//
+// ```novo
+// use onnxopset
+//
+// fn main() [io]
+//     match onnxopset.schema_for("", "Conv", 17)
+//         Some(s) => println("${onnxopset.accepts_inputs(s, 3)}")   // true
+//         None    => println("not in the table")
+// ```
+pub fn accepts_inputs(s: OnnxOpSchema, count: Int) -> Bool []
+    todo("onnx-nv.onnxopset.accepts_inputs")
+
+// Whether an output count fits a schema's arity.
+//
+// ```novo
+// use onnxopset
+//
+// fn main() [io]
+//     match onnxopset.schema_for("", "Conv", 17)
+//         Some(s) => println("${onnxopset.accepts_outputs(s, 1)}")   // true
+//         None    => println("not in the table")
+// ```
+pub fn accepts_outputs(s: OnnxOpSchema, count: Int) -> Bool []
+    todo("onnx-nv.onnxopset.accepts_outputs")
+
+// Whether the operator's last input is variadic.
+//
+// ```novo
+// use onnxopset
+//
+// fn main() [io]
+//     match onnxopset.schema_for("", "Concat", 17)
+//         Some(s) => println("${onnxopset.is_variadic_input(s)}")   // true
+//         None    => println("not in the table")
+// ```
+pub fn is_variadic_input(s: OnnxOpSchema) -> Bool []
+    todo("onnx-nv.onnxopset.is_variadic_input")
+
+// Whether an attribute name is one the operator accepts.
+//
+// ```novo
+// use onnxopset
+//
+// fn main() [io]
+//     match onnxopset.schema_for("", "Conv", 17)
+//         Some(s) => println("${onnxopset.accepts_attribute(s, "kernel_shape")}")
+//         None    => println("not in the table")
+// ```
+pub fn accepts_attribute(s: OnnxOpSchema, name: Str) -> Bool []
+    todo("onnx-nv.onnxopset.accepts_attribute")
+
+// Whether an attribute name is one the operator requires.
+//
+// ```novo
+// use onnxopset
+//
+// fn main() [io]
+//     match onnxopset.schema_for("", "Conv", 17)
+//         Some(s) => println("${onnxopset.requires_attribute(s, "kernel_shape")}")
+//         None    => println("not in the table")
+// ```
+pub fn requires_attribute(s: OnnxOpSchema, name: Str) -> Bool []
+    todo("onnx-nv.onnxopset.requires_attribute")
+
+// Every operator the table carries for a domain, in name order.
+//
+// ```novo
+// use std.list
+// use onnxopset
+//
+// fn main() [io]
+//     println("${list.len(onnxopset.operators_in("")) > 100}")   // true
+// ```
+pub fn operators_in(domain: Str) -> [Str] []
+    todo("onnx-nv.onnxopset.operators_in")
+
+// Every domain the table carries.
+//
+// ```novo
+// use std.list
+// use onnxopset
+//
+// fn main() [io]
+//     println("${list.len(onnxopset.domains()) >= 2}")   // true
+// ```
+pub fn domains() -> [Str] []
+    todo("onnx-nv.onnxopset.domains")
+
+// The version at which an operator's spelling last changed at or
+// before a version, or `None`.
+//
+// What a converter asks to find out whether a node has to be rewritten
+// between two opsets: if this is the same for both, the node is
+// unchanged.
+//
+// ```novo
+// use onnxopset
+//
+// fn main() [io]
+//     match onnxopset.last_change_before("", "Squeeze", 17)
+//         Some(v) => println("${v}")            // 13
+//         None    => println("not in the table")
+// ```
+pub fn last_change_before(domain: Str, op_type: Str, version: Int) -> ?Int []
+    todo("onnx-nv.onnxopset.last_change_before")

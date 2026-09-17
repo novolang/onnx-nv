@@ -1,0 +1,228 @@
+// onnxopset_tests.nv — the operator-set table, the checker over it,
+// and the reader, against the ONNX operator and versioning
+// specifications.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: onnx-nv.<module>.<fn>`.
+
+use std.test
+use std.list
+use std.bytes
+use std.str
+use onnxfault
+use onnxgraph
+use onnxopset
+use onnxcheck
+use onnxio
+
+@test
+fn test_an_operator_is_a_sequence_of_versions_not_one_thing() [io]
+    // Squeeze took its axes as an ATTRIBUTE up to opset 12 and as an
+    // INPUT from opset 13.  A checker that looked only at the op_type
+    // string would pass a model no runtime can load.
+    test.case("the table knows Squeeze at more than one version")
+    test.assert(list.len(onnxopset.versions_of("", "Squeeze")) >= 2)
+
+    test.case("and the schema in force depends on the version asked for")
+    match onnxopset.schema_for("", "Squeeze", 11)
+        Some(s) => test.assert(s.since_version <= 11)
+        None    => test.fail("Squeeze existed at opset 11")
+    match onnxopset.schema_for("", "Squeeze", 17)
+        Some(s) => test.assert(s.since_version >= 13)
+        None    => test.fail("Squeeze exists at opset 17")
+
+    test.case("an operator below the version it was introduced at is not found")
+    match onnxopset.introduced_at("", "Conv")
+        Some(v) =>
+            match onnxopset.schema_for("", "Conv", v - 1)
+                Some(_) => test.fail("Conv did not exist before it was introduced")
+                None    => test.assert(true)
+        None    => test.fail("Conv is in the table")
+
+    test.case("and last_change_before is what a converter compares")
+    match onnxopset.last_change_before("", "Squeeze", 17)
+        Some(v) => test.assert(v >= 13)
+        None    => test.fail("Squeeze is in the table")
+
+@test
+fn test_the_table_knows_what_it_knows_and_says_when_it_does_not() [io]
+    test.case("the operators every model uses are in it")
+    test.assert(onnxopset.is_known("", "Conv"))
+    test.assert(onnxopset.is_known("", "MatMul"))
+    test.assert(onnxopset.is_known("", "Relu"))
+    test.assert(onnxopset.is_known("", "If"))
+
+    test.case("an invented one is not")
+    test.assert(not onnxopset.is_known("", "NotAnOperator"))
+
+    test.case("and a vendor's domain is separate from the default one")
+    test.assert(not onnxopset.is_known("com.example", "Conv"))
+
+    test.case("the default domain carries more than a hundred operators")
+    test.assert(list.len(onnxopset.operators_in("")) > 100)
+
+    test.case("and there is more than one domain")
+    test.assert(list.len(onnxopset.domains()) >= 2)
+
+    test.case("the ceilings are stated as constants")
+    test.assert(onnxopset.ONNX_MAX_OPSET >= 21)
+    test.assert(onnxopset.ONNX_MAX_IR_VERSION >= 10)
+
+@test
+fn test_the_arity_is_what_the_table_carries_and_variadic_is_marked() [io]
+    test.case("Conv takes two or three inputs and gives one output")
+    match onnxopset.schema_for("", "Conv", 17)
+        None    => test.fail("Conv is in the table")
+        Some(s) =>
+            test.assert(onnxopset.accepts_inputs(s, 2))
+            test.assert(onnxopset.accepts_inputs(s, 3))
+            test.assert(not onnxopset.accepts_inputs(s, 1))
+            test.assert(onnxopset.accepts_outputs(s, 1))
+            test.assert(not onnxopset.is_variadic_input(s))
+
+    test.case("Concat takes any number, so only the minimum is checked")
+    match onnxopset.schema_for("", "Concat", 17)
+        None    => test.fail("Concat is in the table")
+        Some(s) =>
+            test.assert(onnxopset.is_variadic_input(s))
+            test.assert(s.max_input == 0 - 1)
+            test.assert(onnxopset.accepts_inputs(s, 9))
+
+    test.case("Conv's kernel_shape is accepted and its epsilon is not")
+    match onnxopset.schema_for("", "Conv", 17)
+        None    => test.fail("Conv is in the table")
+        Some(s) =>
+            test.assert(onnxopset.accepts_attribute(s, "kernel_shape"))
+            test.assert(not onnxopset.accepts_attribute(s, "epsilon"))
+            test.assert(not onnxopset.requires_attribute(s, "kernel_shape"))
+
+@test
+fn test_validation_answers_findings_and_not_a_verdict() [io]
+    // The first problem in a converted model is almost never the
+    // interesting one.  A tool that reports one of twelve is a tool
+    // somebody runs twelve times.
+    test.case("the three severities are named")
+    test.assert(onnxcheck.severity_name(OnnxError) == "error")
+    test.assert(onnxcheck.severity_name(OnnxWarning) == "warning")
+    test.assert(onnxcheck.severity_name(OnnxNote) == "note")
+
+    test.case("an empty model produces a list, not a refusal")
+    let f = onnxcheck.check(onnxgraph.empty_model())
+    test.assert(list.len(f) >= 0)
+
+    test.case("filtering by severity never grows the list")
+    test.assert(list.len(onnxcheck.at_least(f, OnnxError)) <= list.len(f))
+    test.assert(list.len(onnxcheck.at_least(f, OnnxNote)) == list.len(f))
+
+    test.case("has_errors is the one-line question a serving stack asks")
+    test.assert(onnxcheck.has_errors(onnxcheck.at_least(f, OnnxError))
+                == onnxcheck.has_errors(f))
+
+    test.case("findings for one node are what an editor highlights")
+    test.assert(list.len(onnxcheck.for_node(f, 0, 0)) <= list.len(f))
+
+    test.case("and the rendering is text, because a library does not print")
+    test.assert(list.len(onnxcheck.format(f)) == list.len(f))
+
+@test
+fn test_the_graph_level_checks() [io]
+    let m = onnxgraph.empty_model()
+
+    test.case("an empty model uses no unknown operators")
+    test.assert(onnxcheck.operators_are_known(m))
+    test.assert(list.len(onnxcheck.unknown_operators(m)) == 0)
+
+    test.case("and has no dangling inputs and no unused outputs")
+    test.assert(list.len(onnxcheck.dangling_inputs(m)) == 0)
+    test.assert(list.len(onnxcheck.unused_outputs(m)) == 0)
+
+@test
+fn test_the_read_limits_bound_a_crafted_file() [io]
+    let l = onnxio.default_limits()
+
+    test.case("the defaults")
+    test.assert(l.max_depth == 64)
+    test.assert(l.max_bytes > 0)
+    test.assert(l.max_nodes > 0)
+    test.assert(l.read_tensor_data)
+
+    test.case("structure_only skips the weights, which are most of the bytes")
+    test.assert(not onnxio.structure_only().read_tensor_data)
+
+    test.case("and each ceiling is set on its own")
+    test.assert(onnxio.with_max_depth(l, 8).max_depth == 8)
+    test.assert(onnxio.with_max_bytes(l, 1024).max_bytes == 1024)
+
+    test.case("protobuf-nv's limits are derived here, not twice")
+    test.assert(onnxio.protobuf_limits(l).max_depth >= 1)
+
+@test
+fn test_reading_and_writing_and_the_heuristic_sniff() [io]
+    test.case("a protobuf has no magic number, so the sniff is a heuristic")
+    // ModelProto's first field is ir_version, a varint at field 1.
+    test.assert(onnxio.looks_like_onnx(bytes.from_byte_list([0x08, 0x08])))
+    test.assert(not onnxio.looks_like_onnx(bytes.from_byte_list([0x89, 0x50, 0x4E, 0x47])))
+    test.assert(not onnxio.looks_like_onnx(bytes.zeros(0)))
+
+    test.case("an empty message reads as a model with no graph")
+    match onnxio.read(bytes.zeros(0), onnxio.default_limits())
+        Ok(_)  => test.fail("a model must have a graph")
+        Err(e) => test.assert(onnxfault.code(e) == "no_graph")
+
+    test.case("the header alone is the cheapest useful question")
+    match onnxio.read_header(bytes.zeros(0))
+        Ok(m)  => test.assert(m.ir_version >= 0)
+        Err(e) => test.assert(onnxfault.offset_of(e) >= 0 - 1)
+
+    test.case("a model round trips through write")
+    match onnxio.write(onnxgraph.empty_model())
+        Ok(out) => test.assert(bytes.len(out) >= 0)
+        Err(e)  => test.fail(e.message())
+
+    test.case("and its encoded length is answered without encoding it")
+    match onnxio.encoded_len(onnxgraph.empty_model())
+        Ok(n)  => test.assert(n >= 0)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_external_data_is_not_corruption_and_the_predicate_says_so() [io]
+    // Protobuf cannot encode a message larger than two gigabytes, and
+    // model weights passed that years ago.  A caller that treated the
+    // refusal as corruption would reject exactly the models people
+    // care about.
+    test.case("the external refusal is the only one more bytes can fix")
+    test.assert(onnxfault.needs_external_file(OnnxExternalData("W", "model.onnx.data")))
+    test.assert(not onnxfault.needs_external_file(OnnxNoGraph))
+    test.assert(not onnxfault.needs_external_file(OnnxNoOpsetImport))
+
+    test.case("and it names the file to open")
+    test.assert(onnxfault.external_location(
+        OnnxExternalData("W", "model.onnx.data")) == "model.onnx.data")
+    test.assert(onnxfault.external_location(OnnxNoGraph) == "")
+
+    test.case("the whole list is answered in one pass, not one refusal at a time")
+    test.assert(list.len(onnxio.external_files(onnxgraph.empty_model())) == 0)
+
+    test.case("attaching bytes for a tensor that is not there is refused")
+    match onnxio.attach_external(onnxgraph.empty_model(), "W", bytes.zeros(4))
+        Ok(_)  => test.fail("there is no tensor W")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+    test.case("and externalize is the other direction")
+    match onnxio.externalize(onnxgraph.empty_model(), "model.onnx.data", 1024)
+        Ok(pair) => test.assert(bytes.len(pair.1) == 0)
+        Err(e)   => test.fail(e.message())
+
+    test.case("an empty model is far under protobuf's ceiling")
+    test.assert(not onnxio.exceeds_protobuf_limit(onnxgraph.empty_model()))
+
+    test.case("the other refusals carry their codes")
+    test.assert(onnxfault.code(OnnxNoOpsetImport) == "no_opset_import")
+    test.assert(onnxfault.code(OnnxIrVersionTooNew(99, 10)) == "ir_version_too_new")
+    test.assert(onnxfault.code(OnnxTooDeep(64)) == "too_deep")
+    test.assert(onnxfault.code(OnnxTooLarge(9, 8)) == "too_large")
+    test.assert(onnxfault.code(OnnxTensorSizeMismatch("W", 6, 8)) == "tensor_size_mismatch")
+    test.assert(onnxfault.code(OnnxBadUtf8(12, 3)) == "bad_utf8")
+    test.assert(onnxfault.code(OnnxWrongWireType(4, 1, 2, 0)) == "wrong_wire_type")
+    test.assert(onnxfault.code(
+        OnnxAttributeTypeMismatch("n", "axis", "FLOAT", "INT")) == "attribute_type_mismatch")

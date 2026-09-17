@@ -1,0 +1,171 @@
+// onnxattr_tests.nv — attributes, whose declared type is in the file
+// and not inferred, against `onnx.proto`'s `AttributeProto`.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: onnx-nv.onnxattr.<fn>`.
+
+use std.test
+use std.list
+use std.bytes
+use onnxattr
+use onnxtype
+
+@test
+fn test_the_thirteen_attribute_kinds() [io]
+    test.case("the codes AttributeProto.AttributeType gives")
+    test.assert(onnxattr.kind_code(OnnxAttrKindUndefined) == 0)
+    test.assert(onnxattr.kind_code(OnnxAttrKindFloat) == 1)
+    test.assert(onnxattr.kind_code(OnnxAttrKindInt) == 2)
+    test.assert(onnxattr.kind_code(OnnxAttrKindString) == 3)
+    test.assert(onnxattr.kind_code(OnnxAttrKindTensor) == 4)
+    test.assert(onnxattr.kind_code(OnnxAttrKindGraph) == 5)
+    test.assert(onnxattr.kind_code(OnnxAttrKindInts) == 7)
+    test.assert(onnxattr.kind_code(OnnxAttrKindGraphs) == 10)
+
+    test.case("the names are onnx.proto's own")
+    test.assert(onnxattr.kind_name(OnnxAttrKindInts) == "INTS")
+    test.assert(onnxattr.kind_name(OnnxAttrKindGraph) == "GRAPH")
+
+    test.case("a code round trips")
+    test.assert(onnxattr.kind_name(onnxattr.kind_of_code(7)) == "INTS")
+
+    test.case("and an unknown code reads as undefined rather than refusing")
+    // A newer ONNX adding a kind must not make every older reader
+    // refuse the file.
+    test.assert(onnxattr.kind_name(onnxattr.kind_of_code(99)) == "UNDEFINED")
+
+@test
+fn test_an_empty_ints_and_an_empty_floats_stay_different() [io]
+    // They are byte-identical on the wire except for the `type` field,
+    // and `Constant`'s `value` versus `value_floats` is exactly that
+    // case.  A reader that inferred the type from which list is
+    // non-empty gets the empty cases wrong, silently.
+    test.case("an empty list of integers is INTS")
+    test.assert(onnxattr.kind_name(onnxattr.kind_of(OnnxAttrInts([]))) == "INTS")
+
+    test.case("an empty list of floats is FLOATS")
+    test.assert(onnxattr.kind_name(onnxattr.kind_of(OnnxAttrFloats([]))) == "FLOATS")
+
+    test.case("so the two are not the same attribute")
+    test.assert(not onnxattr.kind_name(onnxattr.kind_of(OnnxAttrInts([])))
+                     == onnxattr.kind_name(onnxattr.kind_of(OnnxAttrFloats([]))))
+
+@test
+fn test_the_declared_kind_is_read_from_the_file_not_from_the_value() [io]
+    test.case("a well-formed attribute agrees with itself")
+    let a = onnxattr.ints_attr("kernel_shape", [3, 3])
+    test.assert(onnxattr.kind_name(onnxattr.declared_kind(a)) == "INTS")
+    test.assert(onnxattr.kind_name(onnxattr.kind_of(a.value)) == "INTS")
+    test.assert(onnxattr.is_consistent(a))
+
+    test.case("and one that does not is reported rather than reinterpreted")
+    let bad = OnnxAttribute { name: "axis", declared: OnnxAttrKindFloat,
+                              value: OnnxAttrInt(1), ref_name: "" }
+    test.assert(not onnxattr.is_consistent(bad))
+
+@test
+fn test_the_constructors_and_the_accessors_agree() [io]
+    test.case("an integer attribute")
+    let i = onnxattr.int_attr("axis", 1)
+    test.assert(i.name == "axis")
+    match onnxattr.as_int(i)
+        Some(n) => test.assert(n == 1)
+        None    => test.fail("it is an integer attribute")
+
+    test.case("a list of integers — kernel_shape, pads, strides, axes")
+    match onnxattr.as_ints(onnxattr.ints_attr("pads", [0, 0, 1, 1]))
+        Some(xs) => test.assert(list.len(xs) == 4)
+        None     => test.fail("it is a list of integers")
+
+    test.case("a float")
+    match onnxattr.as_float(onnxattr.float_attr("epsilon", 0.001))
+        Some(f) => test.assert(f == 0.001)
+        None    => test.fail("it is a float attribute")
+
+    test.case("a list of floats")
+    test.assert(onnxattr.floats_attr("scales", [1.0, 2.0]).name == "scales")
+    test.assert(onnxattr.kind_name(onnxattr.declared_kind(
+        onnxattr.floats_attr("scales", [1.0]))) == "FLOATS")
+
+    test.case("a string")
+    match onnxattr.as_string(onnxattr.string_attr("auto_pad", "SAME_UPPER"))
+        Some(s) => test.assert(s == "SAME_UPPER")
+        None    => test.fail("it is a string attribute")
+
+    test.case("and a tensor, which is what Constant's value is")
+    let t = onnxtype.tensor("", OnnxFloat, [1], bytes.zeros(4))
+    match onnxattr.as_tensor(onnxattr.tensor_attr("value", t))
+        Some(x) => test.assert(onnxtype.tensor_element_count(x) == 1)
+        None    => test.fail("it is a tensor attribute")
+
+@test
+fn test_an_accessor_of_the_wrong_type_answers_none_and_not_a_default() [io]
+    // An attribute's default is the OPERATOR's, not this package's:
+    // `axis` defaults to 1 on `Softmax` before opset 13 and to -1
+    // after it, and a library that answered 0 would be silently wrong
+    // on both.
+    test.case("an integer accessor on a string attribute")
+    match onnxattr.as_int(onnxattr.string_attr("auto_pad", "NOTSET"))
+        Some(_) => test.fail("that is a string")
+        None    => test.assert(true)
+
+    test.case("a float accessor on an integer attribute")
+    match onnxattr.as_float(onnxattr.int_attr("axis", 1))
+        Some(_) => test.fail("that is an integer")
+        None    => test.assert(true)
+
+    test.case("an ints accessor on a single integer")
+    match onnxattr.as_ints(onnxattr.int_attr("axis", 1))
+        Some(_) => test.fail("INT and INTS are different kinds")
+        None    => test.assert(true)
+
+    test.case("a tensor accessor on a float")
+    match onnxattr.as_tensor(onnxattr.float_attr("epsilon", 0.001))
+        Some(_) => test.fail("that is a float")
+        None    => test.assert(true)
+
+    test.case("and a string accessor on a tensor")
+    let t = onnxtype.tensor("", OnnxFloat, [1], bytes.zeros(4))
+    match onnxattr.as_string(onnxattr.tensor_attr("value", t))
+        Some(_) => test.fail("that is a tensor")
+        None    => test.assert(true)
+
+@test
+fn test_an_attribute_can_hold_a_subgraph_and_the_walk_finds_it() [io]
+    // `If` has then_branch and else_branch; `Loop` and `Scan` have
+    // body.  A walk that did not descend would report a model with a
+    // control-flow operator as having four nodes.
+    test.case("a graph attribute names one subgraph index")
+    let g = OnnxAttribute { name: "body", declared: OnnxAttrKindGraph,
+                            value: OnnxAttrGraph(1), ref_name: "" }
+    test.assert(list.len(onnxattr.subgraph_indices(g)) == 1)
+    test.assert(list.get(onnxattr.subgraph_indices(g), 0) == 1)
+
+    test.case("a list of graphs names several")
+    let gs = OnnxAttribute { name: "branches", declared: OnnxAttrKindGraphs,
+                             value: OnnxAttrGraphs([1, 2]), ref_name: "" }
+    test.assert(list.len(onnxattr.subgraph_indices(gs)) == 2)
+
+    test.case("and an ordinary attribute names none")
+    test.assert(list.len(onnxattr.subgraph_indices(
+        onnxattr.int_attr("axis", 1))) == 0)
+
+@test
+fn test_looking_an_attribute_up_by_name() [io]
+    let attrs = [onnxattr.int_attr("axis", 1),
+                 onnxattr.ints_attr("kernel_shape", [3, 3])]
+
+    test.case("present")
+    match onnxattr.named(attrs, "kernel_shape")
+        Some(a) => test.assert(onnxattr.kind_name(onnxattr.declared_kind(a)) == "INTS")
+        None    => test.fail("it is in the list")
+
+    test.case("absent")
+    match onnxattr.named(attrs, "epsilon")
+        Some(_) => test.fail("it is not in the list")
+        None    => test.assert(true)
+
+    test.case("and an empty list has nothing in it")
+    match onnxattr.named([], "axis")
+        Some(_) => test.fail("there is nothing there")
+        None    => test.assert(true)

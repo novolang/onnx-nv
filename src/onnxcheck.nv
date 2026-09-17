@@ -1,0 +1,226 @@
+// onnxcheck.nv — validation as a list of findings, not a verdict.
+//
+// A MODEL THAT IS WRONG IS STILL A MODEL
+//
+// A checker that answered `Result<(), Error>` would stop at the first
+// problem, and the first problem in a converted model is almost never
+// the interesting one.  A tool that reports "this model uses `Resize`
+// at opset 10 with four inputs, which opset 10's `Resize` does not
+// take, and eleven other things" is useful; one that reports the first
+// of the twelve is a tool somebody runs twelve times.
+//
+// So `check` answers `[OnnxFinding]` over a model that already read,
+// each finding naming the graph, the node index, the node's name and
+// the rule.  An empty list is a model with nothing to say about it.
+//
+// SEVERITY IS THE CALLER'S DECISION, AND THE FINDING CARRIES WHAT IT
+// NEEDS TO MAKE IT
+//
+// `OnnxSeverity` divides findings into the ones that stop a runtime
+// loading the model and the ones that do not.  A deprecated operator
+// is loadable; an operator that did not exist at the imported version
+// is not.  A conversion pipeline wants both; a serving stack about to
+// accept an upload wants to refuse on the first kind and log the
+// second.
+
+use onnxgraph
+
+// How much a finding matters.
+//
+// ```novo
+// use onnxcheck
+//
+// fn main() [io]
+//     println(onnxcheck.severity_name(OnnxError))   // error
+// ```
+pub enum OnnxSeverity
+    // A runtime will not load this model.
+    OnnxError
+    // A runtime will load it and something about it is wrong or will
+    // stop working: a deprecated operator, a missing declared type, a
+    // node list that is not topologically sorted.
+    OnnxWarning
+    // Worth saying and harmless: an empty node name, a missing
+    // `producer_name`.
+    OnnxNote
+
+// One thing found wrong with a model.
+pub struct OnnxFinding
+    // How much it matters.
+    severity: OnnxSeverity
+    // A short stable code for a log or a metric:
+    // `"op_not_in_opset"`, `"input_arity"`, `"unsorted_nodes"`.
+    code: Str
+    // Which graph, as an index into the model's flat table.  0 is the
+    // main graph.
+    graph: Int
+    // Which node, as an index into that graph's node list, or `-1` for
+    // a finding about the graph or the model.
+    node: Int
+    // The node's name, which ONNX allows to be empty — which is why
+    // the index is carried too.
+    node_name: Str
+    // The sentence: what was found, and what the rule is.
+    message: Str
+
+// The severity's name: `"error"`, `"warning"`, `"note"`.
+//
+// ```novo
+// use onnxcheck
+//
+// fn main() [io]
+//     println(onnxcheck.severity_name(OnnxWarning))   // warning
+// ```
+pub fn severity_name(s: OnnxSeverity) -> Str []
+    todo("onnx-nv.onnxcheck.severity_name")
+
+// Everything wrong with a model.
+//
+// The arity of every node against the schema in force at the version
+// its domain was imported at; every required attribute; every
+// attribute name the operator does not accept; every value a node
+// consumes that nothing produces; the topological order; the
+// initializer sizes; the IR version.
+//
+// An empty list means nothing was found, which is not quite the same
+// as "the model is correct" — the table carries arity and not
+// semantics, and the README says so.
+//
+// ```novo
+// use std.list
+// use onnxcheck
+// use onnxgraph
+//
+// fn main() [io]
+//     println("${list.len(onnxcheck.check(onnxgraph.empty_model())) >= 0}")
+// ```
+pub fn check(m: OnnxModel) -> [OnnxFinding] []
+    todo("onnx-nv.onnxcheck.check")
+
+// Only the findings at or above a severity.
+//
+// ```novo
+// use std.list
+// use onnxcheck
+// use onnxgraph
+//
+// fn main() [io]
+//     let all = onnxcheck.check(onnxgraph.empty_model())
+//     println("${list.len(onnxcheck.at_least(all, OnnxError)) <= list.len(all)}")
+// ```
+pub fn at_least(findings: [OnnxFinding], s: OnnxSeverity) -> [OnnxFinding] []
+    todo("onnx-nv.onnxcheck.at_least")
+
+// Whether any finding is an error.
+//
+// The one-line question a serving stack asks before it accepts an
+// upload.
+//
+// ```novo
+// use onnxcheck
+// use onnxgraph
+//
+// fn main() [io]
+//     println("${onnxcheck.has_errors(onnxcheck.check(onnxgraph.empty_model()))}")
+// ```
+pub fn has_errors(findings: [OnnxFinding]) -> Bool []
+    todo("onnx-nv.onnxcheck.has_errors")
+
+// The findings for one node only.
+//
+// The whole of a node's problems, which is what an editor highlighting
+// a graph shows when a user selects one.
+//
+// ```novo
+// use std.list
+// use onnxcheck
+// use onnxgraph
+//
+// fn main() [io]
+//     let all = onnxcheck.check(onnxgraph.empty_model())
+//     println("${list.len(onnxcheck.for_node(all, 0, 0))}")   // 0
+// ```
+pub fn for_node(findings: [OnnxFinding], graph: Int, node: Int) -> [OnnxFinding] []
+    todo("onnx-nv.onnxcheck.for_node")
+
+// Whether every operator in the model is one the carried table knows
+// at the version the model imported.
+//
+// WHAT A RUNTIME ASKS BEFORE IT LOADS ANYTHING.  Answering it costs
+// one walk; discovering it during execution costs a half-finished run
+// and a device buffer nobody freed.
+//
+// ```novo
+// use onnxcheck
+// use onnxgraph
+//
+// fn main() [io]
+//     println("${onnxcheck.operators_are_known(onnxgraph.empty_model())}")   // true
+// ```
+pub fn operators_are_known(m: OnnxModel) -> Bool []
+    todo("onnx-nv.onnxcheck.operators_are_known")
+
+// Every operator the model uses that the table does not know at the
+// imported version, as a domain and an op type.
+//
+// ```novo
+// use std.list
+// use onnxcheck
+// use onnxgraph
+//
+// fn main() [io]
+//     println("${list.len(onnxcheck.unknown_operators(onnxgraph.empty_model()))}")   // 0
+// ```
+pub fn unknown_operators(m: OnnxModel) -> [(Str, Str)] []
+    todo("onnx-nv.onnxcheck.unknown_operators")
+
+// Every value a node consumes that nothing in its graph produces and
+// that is not a graph input or an initializer.
+//
+// A dangling name is the commonest defect in a hand-edited model and
+// the one whose error message from a runtime is least helpful.
+//
+// ```novo
+// use std.list
+// use onnxcheck
+// use onnxgraph
+//
+// fn main() [io]
+//     println("${list.len(onnxcheck.dangling_inputs(onnxgraph.empty_model()))}")   // 0
+// ```
+pub fn dangling_inputs(m: OnnxModel) -> [Str] []
+    todo("onnx-nv.onnxcheck.dangling_inputs")
+
+// Every value that is produced and never consumed and is not a graph
+// output.
+//
+// Dead weight rather than an error: a pruned model carries them, and a
+// tool that strips them wants the list.
+//
+// ```novo
+// use std.list
+// use onnxcheck
+// use onnxgraph
+//
+// fn main() [io]
+//     println("${list.len(onnxcheck.unused_outputs(onnxgraph.empty_model()))}")   // 0
+// ```
+pub fn unused_outputs(m: OnnxModel) -> [Str] []
+    todo("onnx-nv.onnxcheck.unused_outputs")
+
+// The findings rendered one per line, each naming its severity, its
+// code and where it was.
+//
+// Text and not printing.  A library does not print; the caller writes
+// these wherever its output goes.
+//
+// ```novo
+// use std.list
+// use onnxcheck
+// use onnxgraph
+//
+// fn main() [io]
+//     println("${list.len(onnxcheck.format(onnxcheck.check(onnxgraph.empty_model())))}")
+// ```
+pub fn format(findings: [OnnxFinding]) -> [Str] []
+    todo("onnx-nv.onnxcheck.format")

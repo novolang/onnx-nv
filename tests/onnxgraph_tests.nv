@@ -1,0 +1,173 @@
+// onnxgraph_tests.nv — the model, the graph, the nodes, and the
+// subgraph table, against `onnx.proto`'s `ModelProto`, `GraphProto`
+// and `NodeProto`.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: onnx-nv.onnxgraph.<fn>`.
+
+use std.test
+use std.list
+use onnxattr
+use onnxfault
+use onnxgraph
+
+@test
+fn test_a_model_has_one_flat_table_of_graphs() [io]
+    // A graph holds nodes, a node holds attributes, and an attribute
+    // can hold a graph.  That is a directly recursive value type,
+    // which cannot be written — so the graphs are flat and an
+    // attribute refers to one by index.
+    test.case("an empty model has exactly one graph, the main one")
+    let m = onnxgraph.empty_model()
+    test.assert(list.len(m.graphs) == 1)
+    test.assert(m.main == 0)
+    test.assert(list.len(onnxgraph.main_graph(m).node) == 0)
+
+    test.case("an index past the table answers None")
+    match onnxgraph.subgraph_at(m, 9)
+        Some(_) => test.fail("there is one graph")
+        None    => test.assert(true)
+
+    test.case("and index 0 is the main graph")
+    match onnxgraph.subgraph_at(m, 0)
+        Some(g) => test.assert(list.len(g.node) == 0)
+        None    => test.fail("index 0 is always there")
+
+@test
+fn test_the_ir_version_and_the_opset_version_are_two_different_numbers() [io]
+    // Confused constantly: ir_version 8 with opset_import 17 is an
+    // ordinary 2022 model.
+    test.case("an opset import is a domain and a version")
+    let i = onnxgraph.opset_import("ai.onnx.ml", 3)
+    test.assert(i.domain == "ai.onnx.ml")
+    test.assert(i.version == 3)
+
+    test.case("a model with no imports answers None for the default domain")
+    match onnxgraph.opset_version(onnxgraph.empty_model(), "")
+        Some(_) => test.fail("an empty model imports nothing")
+        None    => test.assert(true)
+
+    test.case("and the ir_version is its own field")
+    test.assert(onnxgraph.empty_model().ir_version >= 0)
+
+@test
+fn test_an_empty_input_name_is_an_omitted_optional_and_its_place_matters() [io]
+    // Clip's min can be empty with its max present.  A reader that
+    // filtered the empty names out would shift max into min's place
+    // and change what the model computes.
+    let n = onnxgraph.node("c", "Clip", ["x", "", "hi"], ["y"])
+
+    test.case("the list keeps the empty string")
+    test.assert(list.len(n.input) == 3)
+    test.assert(list.get(n.input, 1) == "")
+
+    test.case("the supplied count excludes it")
+    test.assert(onnxgraph.supplied_input_count(n) == 2)
+
+    test.case("and the position is answered on its own")
+    test.assert(onnxgraph.has_input_at(n, 0))
+    test.assert(not onnxgraph.has_input_at(n, 1))
+    test.assert(onnxgraph.has_input_at(n, 2))
+
+    test.case("a position past the end is not supplied")
+    test.assert(not onnxgraph.has_input_at(n, 9))
+
+@test
+fn test_a_node_carries_its_operator_and_its_attributes() [io]
+    test.case("the constructor sets the four lists")
+    let n = onnxgraph.node("conv1", "Conv", ["x", "W"], ["y"])
+    test.assert(n.name == "conv1")
+    test.assert(n.op_type == "Conv")
+    test.assert(n.domain == "")
+    test.assert(list.len(n.output) == 1)
+
+    test.case("an attribute is added by name and replaces one of the same name")
+    let k = onnxgraph.with_attribute(n, onnxattr.ints_attr("kernel_shape", [3, 3]))
+    test.assert(list.len(k.attribute) == 1)
+    let k2 = onnxgraph.with_attribute(k, onnxattr.ints_attr("kernel_shape", [5, 5]))
+    test.assert(list.len(k2.attribute) == 1)
+
+    test.case("and it reads back")
+    match onnxgraph.attribute_of(k, "kernel_shape")
+        Some(a) => test.assert(onnxattr.as_ints(a) == Some([3, 3]))
+        None    => test.fail("it was just set")
+
+    test.case("an absent attribute is None")
+    match onnxgraph.attribute_of(n, "kernel_shape")
+        Some(_) => test.fail("nothing set one")
+        None    => test.assert(true)
+
+@test
+fn test_the_walk_over_every_node_does_not_miss_control_flow() [io]
+    test.case("an empty model has no nodes anywhere")
+    test.assert(list.len(onnxgraph.all_nodes(onnxgraph.empty_model())) == 0)
+
+    test.case("the walk carries which graph each node came from")
+    // A caller that iterated the main graph's node list would report a
+    // model with an If as having four nodes and would never see the
+    // branches.
+    let nodes = onnxgraph.all_nodes(onnxgraph.empty_model())
+    test.assert(list.len(nodes) == 0)
+
+    test.case("a node with no graph attributes refers to no subgraphs")
+    test.assert(list.len(onnxgraph.walk_subgraphs(
+        onnxgraph.node("f", "Relu", ["x"], ["y"]))) == 0)
+
+@test
+fn test_the_edges_are_the_names_and_the_joins_are_written_once() [io]
+    // There is no edge list in ONNX: a node's output is a list of
+    // names and another node's input is the same names.
+    let g = onnxgraph.main_graph(onnxgraph.empty_model())
+
+    test.case("nothing produces a name in an empty graph")
+    match onnxgraph.producer_of(g, "y")
+        Some(_) => test.fail("there are no nodes")
+        None    => test.assert(true)
+
+    test.case("and nothing consumes one")
+    test.assert(list.len(onnxgraph.consumers_of(g, "x")) == 0)
+
+    test.case("an absent initializer is None")
+    match onnxgraph.initializer_of(g, "W")
+        Some(_) => test.fail("there are none")
+        None    => test.assert(true)
+
+    test.case("an undeclared type is None, which is ordinary for an intermediate")
+    match onnxgraph.type_of(g, "x")
+        Some(_) => test.fail("nothing is declared")
+        None    => test.assert(true)
+
+@test
+fn test_initializers_that_are_also_inputs_are_not_true_inputs() [io]
+    // Before IR version 4 an initializer had to appear in `input` as
+    // well, so a serving stack that trusted `input` would ask for a
+    // hundred tensors it already has.
+    test.case("an empty graph has no inputs of either kind")
+    let g = onnxgraph.main_graph(onnxgraph.empty_model())
+    test.assert(list.len(onnxgraph.true_inputs(g)) == 0)
+    test.assert(list.len(g.input) == 0)
+    test.assert(list.len(g.initializer) == 0)
+
+@test
+fn test_topological_order_both_checks_and_answers() [io]
+    // ONNX requires the file to store the nodes in order already, and
+    // a great many exporters have got it wrong.
+    test.case("an empty graph is sorted and its order is empty")
+    let g = onnxgraph.main_graph(onnxgraph.empty_model())
+    test.assert(onnxgraph.is_sorted(g))
+    match onnxgraph.topological_order(g)
+        Ok(order) => test.assert(list.len(order) == 0)
+        Err(e)    => test.fail(e.message())
+
+    test.case("and a cycle is a refusal naming the node it was found at")
+    test.assert(onnxfault.code(OnnxGraphHasCycle(3, "loop")) == "graph_has_cycle")
+
+@test
+fn test_the_two_questions_a_runtime_asks_before_it_loads_anything() [io]
+    test.case("how many bytes of weights")
+    test.assert(onnxgraph.weight_bytes(onnxgraph.empty_model()) == 0)
+
+    test.case("and which operators")
+    // Answering it from the graph costs one walk; discovering it
+    // during execution costs a half-finished run.
+    test.assert(list.len(onnxgraph.operators_used(onnxgraph.empty_model())) == 0)

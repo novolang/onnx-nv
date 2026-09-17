@@ -1,0 +1,379 @@
+// onnxattr.nv — an attribute is a tagged union, and the tag is in the
+// file.
+//
+// THE TYPE IS DECLARED, NOT INFERRED
+//
+// `AttributeProto` has one field per possible type — `f`, `i`, `s`,
+// `t`, `g`, `floats`, `ints`, `strings`, `tensors`, `graphs` — and a
+// separate `type` field saying which of them is meant.  They are not
+// redundant: a `floats` attribute with an empty list and an `ints`
+// attribute with an empty list are byte-identical on the wire except
+// for the `type` field, and `Constant`'s `value` versus `value_floats`
+// is exactly that case.
+//
+// So `OnnxAttribute` carries the declared type as the variant it is,
+// and `onnxattr.declared_kind` reads it back rather than inferring it
+// from which list is non-empty.  A reader that inferred would get the
+// empty cases wrong, silently, in the models that use them.
+//
+// AN ATTRIBUTE CAN HOLD A GRAPH
+//
+// `If` has `then_branch` and `else_branch`; `Loop` has `body`;
+// `Scan` has `body`.  Each is a whole `GraphProto` inside an
+// attribute, with its own nodes, its own initializers and its own
+// value infos, and a walk that did not descend into them would report
+// a model with a control-flow operator as having four nodes.
+//
+// That is why `OnnxAttrGraph` exists and why `onnxgraph.walk_subgraphs`
+// does.  It is also why the reader has a depth limit: a crafted model
+// can nest subgraphs without end.
+
+use onnxtype
+
+// Which of `AttributeProto`'s value fields is meant.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     println("${onnxattr.kind_code(OnnxAttrKindInts)}")   // 7
+// ```
+pub enum OnnxAttrKind
+    // 0: the file did not say.  Legal in the schema and a defect in a
+    // model, which `onnxcheck` reports.
+    OnnxAttrKindUndefined
+    // 1: a single float.
+    OnnxAttrKindFloat
+    // 2: a single integer.
+    OnnxAttrKindInt
+    // 3: a single string.
+    OnnxAttrKindString
+    // 4: a single tensor.
+    OnnxAttrKindTensor
+    // 5: a single graph.
+    OnnxAttrKindGraph
+    // 6: a list of floats.
+    OnnxAttrKindFloats
+    // 7: a list of integers.  What every `kernel_shape`, `pads`,
+    // `strides` and `axes` is.
+    OnnxAttrKindInts
+    // 8: a list of strings.
+    OnnxAttrKindStrings
+    // 9: a list of tensors.
+    OnnxAttrKindTensors
+    // 10: a list of graphs.
+    OnnxAttrKindGraphs
+    // 11: a sparse tensor.  Declared so a model that uses one reads;
+    // this package carries no sparse tensor type and keeps the bytes.
+    OnnxAttrKindSparseTensor
+    // 12: a type proto.  Used by `Cast`-like operators in newer
+    // opsets, and kept as bytes for the same reason.
+    OnnxAttrKindTypeProto
+
+// One attribute's value.
+//
+// The arm IS the declared type, so an empty `OnnxAttrInts` and an
+// empty `OnnxAttrFloats` stay different — which is the distinction
+// `Constant`'s `value` versus `value_floats` depends on.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     println(onnxattr.kind_name(onnxattr.kind_of(OnnxAttrInt(3))))
+// ```
+pub enum OnnxAttrValue
+    // A single float.
+    OnnxAttrFloat(value: Float)
+    // A single integer.  ONNX integers are 64-bit.
+    OnnxAttrInt(value: Int)
+    // A single string.
+    OnnxAttrString(value: Str)
+    // A single tensor.
+    OnnxAttrTensor(value: OnnxTensor)
+    // A subgraph, by index into the model's subgraph table — NOT the
+    // graph itself, because a graph holds nodes which hold attributes
+    // which can hold graphs, and a directly recursive value type
+    // cannot be written.  `onnxgraph.subgraph_at` resolves it.
+    OnnxAttrGraph(index: Int)
+    // A list of floats.
+    OnnxAttrFloats(values: [Float])
+    // A list of integers.
+    OnnxAttrInts(values: [Int])
+    // A list of strings.
+    OnnxAttrStrings(values: [Str])
+    // A list of tensors.
+    OnnxAttrTensors(values: [OnnxTensor])
+    // A list of subgraphs, by index.
+    OnnxAttrGraphs(indices: [Int])
+    // A value this package does not model, kept as the bytes the file
+    // held so that a write puts them back unchanged.
+    OnnxAttrRaw(kind: OnnxAttrKind, data: Bytes)
+
+// One attribute: a name, a declared kind, and a value.
+pub struct OnnxAttribute
+    // The name the operator's schema knows it by: `kernel_shape`,
+    // `axis`, `epsilon`.
+    name: Str
+    // What the FILE declared the type to be.  Carried separately from
+    // the value's arm so that a model whose `type` field disagrees
+    // with the field it filled is reported rather than quietly
+    // reinterpreted.
+    declared: OnnxAttrKind
+    // The value.
+    value: OnnxAttrValue
+    // The `ref_attr_name`, or `""`.  Non-empty only inside a function
+    // body, where an attribute is a parameter of the function rather
+    // than a value.
+    ref_name: Str
+
+// The kind's numeric code, 0 to 12.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     println("${onnxattr.kind_code(OnnxAttrKindGraph)}")   // 5
+// ```
+pub fn kind_code(k: OnnxAttrKind) -> Int []
+    todo("onnx-nv.onnxattr.kind_code")
+
+// The kind a code names, or `OnnxAttrKindUndefined`.
+//
+// Lenient, because a newer ONNX adding a kind must not make every
+// older reader refuse the file: an unknown kind reads as undefined
+// and the bytes are kept in `OnnxAttrRaw`.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     println(onnxattr.kind_name(onnxattr.kind_of_code(99)))   // UNDEFINED
+// ```
+pub fn kind_of_code(code: Int) -> OnnxAttrKind []
+    todo("onnx-nv.onnxattr.kind_of_code")
+
+// The kind's name as `onnx.proto` spells it: `"FLOAT"`, `"INTS"`,
+// `"GRAPH"`.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     println(onnxattr.kind_name(OnnxAttrKindInts))   // INTS
+// ```
+pub fn kind_name(k: OnnxAttrKind) -> Str []
+    todo("onnx-nv.onnxattr.kind_name")
+
+// The kind a value's arm corresponds to.
+//
+// NOT the same question as `declared_kind`: this reads the value, that
+// reads the file's `type` field, and a model where they disagree is
+// what `onnxcheck` reports.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     println(onnxattr.kind_name(onnxattr.kind_of(OnnxAttrInts([1, 2]))))   // INTS
+// ```
+pub fn kind_of(v: OnnxAttrValue) -> OnnxAttrKind []
+    todo("onnx-nv.onnxattr.kind_of")
+
+// The kind the FILE declared for an attribute.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     let a = onnxattr.int_attr("axis", 1)
+//     println(onnxattr.kind_name(onnxattr.declared_kind(a)))   // INT
+// ```
+pub fn declared_kind(a: OnnxAttribute) -> OnnxAttrKind []
+    todo("onnx-nv.onnxattr.declared_kind")
+
+// Whether the declared kind and the value's arm agree.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     println("${onnxattr.is_consistent(onnxattr.int_attr("axis", 1))}")   // true
+// ```
+pub fn is_consistent(a: OnnxAttribute) -> Bool []
+    todo("onnx-nv.onnxattr.is_consistent")
+
+// An integer attribute.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     println(onnxattr.int_attr("axis", 1).name)   // axis
+// ```
+pub fn int_attr(name: Str, value: Int) -> OnnxAttribute []
+    todo("onnx-nv.onnxattr.int_attr")
+
+// A list-of-integers attribute: what `kernel_shape`, `pads`,
+// `strides` and `axes` all are.
+//
+// ```novo
+// use std.list
+// use onnxattr
+//
+// fn main() [io]
+//     let a = onnxattr.ints_attr("kernel_shape", [3, 3])
+//     println(onnxattr.kind_name(onnxattr.declared_kind(a)))   // INTS
+// ```
+pub fn ints_attr(name: Str, values: [Int]) -> OnnxAttribute []
+    todo("onnx-nv.onnxattr.ints_attr")
+
+// A float attribute.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     println(onnxattr.float_attr("epsilon", 1e-5).name)   // epsilon
+// ```
+pub fn float_attr(name: Str, value: Float) -> OnnxAttribute []
+    todo("onnx-nv.onnxattr.float_attr")
+
+// A list-of-floats attribute.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     println(onnxattr.floats_attr("scales", [1.0, 2.0]).name)   // scales
+// ```
+pub fn floats_attr(name: Str, values: [Float]) -> OnnxAttribute []
+    todo("onnx-nv.onnxattr.floats_attr")
+
+// A string attribute.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     println(onnxattr.string_attr("auto_pad", "SAME_UPPER").name)
+// ```
+pub fn string_attr(name: Str, value: Str) -> OnnxAttribute []
+    todo("onnx-nv.onnxattr.string_attr")
+
+// A tensor attribute: what `Constant`'s `value` is.
+//
+// ```novo
+// use std.bytes
+// use onnxattr
+// use onnxtype
+//
+// fn main() [io]
+//     let t = onnxtype.tensor("", OnnxFloat, [1], bytes.zeros(4))
+//     println(onnxattr.tensor_attr("value", t).name)   // value
+// ```
+pub fn tensor_attr(name: Str, value: OnnxTensor) -> OnnxAttribute []
+    todo("onnx-nv.onnxattr.tensor_attr")
+
+// An integer attribute's value, or `None` when it is not one.
+//
+// `None` rather than a default, because an attribute's default is the
+// OPERATOR's, not this package's: `axis` defaults to 1 on `Softmax`
+// before opset 13 and to -1 after it, and a library that answered 0
+// would be silently wrong on both.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     match onnxattr.as_int(onnxattr.int_attr("axis", 1))
+//         Some(n) => println("${n}")            // 1
+//         None    => println("not an integer attribute")
+// ```
+pub fn as_int(a: OnnxAttribute) -> ?Int []
+    todo("onnx-nv.onnxattr.as_int")
+
+// A list-of-integers attribute's value, or `None`.
+//
+// ```novo
+// use std.list
+// use onnxattr
+//
+// fn main() [io]
+//     match onnxattr.as_ints(onnxattr.ints_attr("pads", [0, 0, 1, 1]))
+//         Some(xs) => println("${list.len(xs)}")   // 4
+//         None     => println("not a list of integers")
+// ```
+pub fn as_ints(a: OnnxAttribute) -> ?[Int] []
+    todo("onnx-nv.onnxattr.as_ints")
+
+// A float attribute's value, or `None`.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     match onnxattr.as_float(onnxattr.float_attr("epsilon", 1e-5))
+//         Some(f) => println("${f > 0.0}")      // true
+//         None    => println("not a float attribute")
+// ```
+pub fn as_float(a: OnnxAttribute) -> ?Float []
+    todo("onnx-nv.onnxattr.as_float")
+
+// A string attribute's value, or `None`.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     match onnxattr.as_string(onnxattr.string_attr("auto_pad", "NOTSET"))
+//         Some(s) => println(s)                 // NOTSET
+//         None    => println("not a string attribute")
+// ```
+pub fn as_string(a: OnnxAttribute) -> ?Str []
+    todo("onnx-nv.onnxattr.as_string")
+
+// A tensor attribute's value, or `None`.
+//
+// ```novo
+// use std.bytes
+// use onnxattr
+// use onnxtype
+//
+// fn main() [io]
+//     let t = onnxtype.tensor("", OnnxFloat, [1], bytes.zeros(4))
+//     match onnxattr.as_tensor(onnxattr.tensor_attr("value", t))
+//         Some(x) => println("${onnxtype.tensor_element_count(x)}")   // 1
+//         None    => println("not a tensor attribute")
+// ```
+pub fn as_tensor(a: OnnxAttribute) -> ?OnnxTensor []
+    todo("onnx-nv.onnxattr.as_tensor")
+
+// The subgraph indices an attribute refers to, in order.
+//
+// Empty for every attribute that is not a graph or a list of graphs.
+// What a walk over a model with `If`, `Loop` or `Scan` follows.
+//
+// ```novo
+// use std.list
+// use onnxattr
+//
+// fn main() [io]
+//     println("${list.len(onnxattr.subgraph_indices(onnxattr.int_attr("axis", 1)))}")
+// ```
+pub fn subgraph_indices(a: OnnxAttribute) -> [Int] []
+    todo("onnx-nv.onnxattr.subgraph_indices")
+
+// The attribute with a given name from a list, or `None`.
+//
+// ```novo
+// use onnxattr
+//
+// fn main() [io]
+//     let attrs = [onnxattr.int_attr("axis", 1)]
+//     match onnxattr.named(attrs, "axis")
+//         Some(a) => println(a.name)            // axis
+//         None    => println("absent")
+// ```
+pub fn named(attrs: [OnnxAttribute], name: Str) -> ?OnnxAttribute []
+    todo("onnx-nv.onnxattr.named")

@@ -1,0 +1,407 @@
+// onnxtype.nv — element types, shapes whose dimensions may be names,
+// tensors and value infos.
+//
+// A DIMENSION IS A NUMBER OR A NAME, NEVER A ZERO
+//
+// ONNX lets a dimension be either a fixed value or a `dim_param`: a
+// STRING naming a dimension whose size is decided when the model runs.
+// `batch` is the famous one, and a model exported for serving has it
+// on every input.
+//
+// A library that flattened that to an integer — zero, or minus one —
+// has thrown away the thing the consumer needed: a serving stack
+// deciding whether two models can share a batch needs to know that
+// both call it `batch`, and a shape checker needs to know that
+// `sequence` in one place and `sequence` in another are the SAME
+// unknown.  So `OnnxDim` has two arms and one of them carries the
+// name, and a third for the case the file leaves genuinely blank.
+//
+// A TENSOR'S BYTES ARE KEPT RAW
+//
+// `TensorProto` can carry its data in a typed repeated field
+// (`float_data`, `int32_data`) or in `raw_data`, a byte string in the
+// tensor's own element order and the machine's little-endian layout.
+// Every real exporter writes `raw_data`, because the typed fields cost
+// a varint per element.
+//
+// This package hands back the bytes and the element type, and does not
+// decode them into a list of floats.  A four-gigabyte weight tensor
+// decoded into a `[Float]` is four gigabytes of boxed numbers, and the
+// caller that wanted it wanted it in a buffer it chose.
+// `onnxtype.element_count` and `onnxtype.element_bytes` are what it
+// needs to do that.
+
+// The element type of a tensor: `TensorProto.DataType`.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println("${onnxtype.type_code(OnnxFloat)}")   // 1
+// ```
+pub enum OnnxDataType
+    // 0: the file did not say.  Legal in the schema and meaningless
+    // in a tensor, so it is carried rather than guessed at.
+    OnnxUndefined
+    // 1: 32-bit IEEE float.
+    OnnxFloat
+    // 2: unsigned 8-bit.
+    OnnxUint8
+    // 3: signed 8-bit.
+    OnnxInt8
+    // 4: unsigned 16-bit.
+    OnnxUint16
+    // 5: signed 16-bit.
+    OnnxInt16
+    // 6: signed 32-bit.
+    OnnxInt32
+    // 7: signed 64-bit.  What every shape and index in ONNX is.
+    OnnxInt64
+    // 8: a UTF-8 string.  Stored in `string_data`, never in
+    // `raw_data`, which is the one exception to the raw-bytes rule.
+    OnnxString
+    // 9: a boolean, one byte each.
+    OnnxBool
+    // 10: 16-bit IEEE float.
+    OnnxFloat16
+    // 11: 64-bit IEEE float.
+    OnnxDouble
+    // 12: unsigned 32-bit.
+    OnnxUint32
+    // 13: unsigned 64-bit.
+    OnnxUint64
+    // 14: a complex number of two 32-bit floats.
+    OnnxComplex64
+    // 15: a complex number of two 64-bit floats.
+    OnnxComplex128
+    // 16: bfloat16 — the same exponent range as `OnnxFloat` with
+    // seven fewer mantissa bits, which is why a model trained in it
+    // converts to float32 without overflowing and a float16 one does
+    // not.
+    OnnxBfloat16
+
+// One dimension of a shape.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println(onnxtype.dim_text(OnnxDimParam("batch")))   // batch
+// ```
+pub enum OnnxDim
+    // A fixed size.
+    OnnxDimValue(size: Int)
+    // A symbolic size, named.  Two dimensions with the same name are
+    // the same unknown, which is the fact a shape checker is built on
+    // and the fact an integer cannot carry.
+    OnnxDimParam(name: Str)
+    // The file gave neither.  A dimension of unknown rank, which
+    // `Reshape` with a computed shape produces.
+    OnnxDimUnknown
+
+// A tensor's shape: its rank and its dimensions.
+//
+// ```novo
+// use std.list
+// use onnxtype
+//
+// fn main() [io]
+//     let s = onnxtype.shape([OnnxDimParam("batch"), OnnxDimValue(3)])
+//     println("${onnxtype.rank(s)}")            // 2
+// ```
+pub struct OnnxShape
+    // The dimensions, outermost first.
+    dims: [OnnxDim]
+
+// A tensor: an initializer's weights, or a constant attribute's value.
+pub struct OnnxTensor
+    // The name, which an initializer has and a constant attribute's
+    // value usually does not.
+    name: Str
+    // The element type.
+    data_type: OnnxDataType
+    // The shape, as fixed sizes.  An initializer's dimensions are
+    // always numbers: a weight with a symbolic dimension would be a
+    // weight of unknown size.
+    dims: [Int]
+    // The elements, in the layout `raw_data` uses: the tensor's own
+    // order, little-endian, no padding.  Empty for a string tensor,
+    // whose elements are in `strings`.
+    raw: Bytes
+    // A string tensor's elements.  Empty for every other type.
+    strings: [Str]
+    // Where the data lives when it is not in this message at all, or
+    // `""`.  Set for any tensor above the two-gigabyte protobuf
+    // ceiling, which is every large model's weights.
+    external_location: Str
+
+// What a graph input, output or intermediate value is declared to be.
+pub struct OnnxValueInfo
+    // The name, which is what a node's input and output lists refer
+    // to.
+    name: Str
+    // The element type.
+    elem_type: OnnxDataType
+    // The shape, whose dimensions may be names.
+    shape: OnnxShape
+    // The `doc_string`, or `""`.
+    doc: Str
+
+// The type's numeric code, 0 to 16.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println("${onnxtype.type_code(OnnxInt64)}")   // 7
+// ```
+pub fn type_code(t: OnnxDataType) -> Int []
+    todo("onnx-nv.onnxtype.type_code")
+
+// The type a code names, or `OnnxUnknownDataType`.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     match onnxtype.type_of_code(99)
+//         Ok(_)  => println("this cannot happen — there are seventeen")
+//         Err(e) => println(e.message())
+// ```
+pub fn type_of_code(code: Int) -> Result<OnnxDataType, OnnxFault> []
+    todo("onnx-nv.onnxtype.type_of_code")
+
+// The type's name as `onnx.proto` spells it: `"FLOAT"`, `"INT64"`,
+// `"BFLOAT16"`.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println(onnxtype.type_name(OnnxBfloat16))   // BFLOAT16
+// ```
+pub fn type_name(t: OnnxDataType) -> Str []
+    todo("onnx-nv.onnxtype.type_name")
+
+// How many bytes one element takes, or `0` for `OnnxString` and
+// `OnnxUndefined`, neither of which has a fixed width.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println("${onnxtype.element_bytes(OnnxFloat16)}")   // 2
+//     println("${onnxtype.element_bytes(OnnxString)}")    // 0
+// ```
+pub fn element_bytes(t: OnnxDataType) -> Int []
+    todo("onnx-nv.onnxtype.element_bytes")
+
+// Whether the type is floating point: the two complex types included,
+// because their components are.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println("${onnxtype.is_float(OnnxBfloat16)}")   // true
+//     println("${onnxtype.is_float(OnnxInt64)}")      // false
+// ```
+pub fn is_float(t: OnnxDataType) -> Bool []
+    todo("onnx-nv.onnxtype.is_float")
+
+// A shape from its dimensions.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println("${onnxtype.rank(onnxtype.shape([OnnxDimValue(1)]))}")   // 1
+// ```
+pub fn shape(dims: [OnnxDim]) -> OnnxShape []
+    todo("onnx-nv.onnxtype.shape")
+
+// A shape whose every dimension is a fixed number.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println("${onnxtype.is_fully_known(onnxtype.fixed_shape([1, 3, 224, 224]))}")
+// ```
+pub fn fixed_shape(dims: [Int]) -> OnnxShape []
+    todo("onnx-nv.onnxtype.fixed_shape")
+
+// How many dimensions the shape has.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println("${onnxtype.rank(onnxtype.fixed_shape([1, 3, 224, 224]))}")   // 4
+// ```
+pub fn rank(s: OnnxShape) -> Int []
+    todo("onnx-nv.onnxtype.rank")
+
+// A dimension as text: its number, its name, or `"?"`.
+//
+// What a shape is printed with, and the reason the three cases are
+// distinguishable at all.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println(onnxtype.dim_text(OnnxDimValue(224)))   // 224
+//     println(onnxtype.dim_text(OnnxDimUnknown))      // ?
+// ```
+pub fn dim_text(d: OnnxDim) -> Str []
+    todo("onnx-nv.onnxtype.dim_text")
+
+// The shape as text: `"batch x 3 x 224 x 224"`.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println(onnxtype.shape_text(onnxtype.shape([OnnxDimParam("batch"),
+//                                                 OnnxDimValue(3)])))
+// ```
+pub fn shape_text(s: OnnxShape) -> Str []
+    todo("onnx-nv.onnxtype.shape_text")
+
+// Whether every dimension is a fixed number.
+//
+// The question a caller allocating a buffer asks before it tries.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     println("${onnxtype.is_fully_known(onnxtype.shape([OnnxDimParam("batch")]))}")
+// ```
+pub fn is_fully_known(s: OnnxShape) -> Bool []
+    todo("onnx-nv.onnxtype.is_fully_known")
+
+// How many elements the shape holds, or `None` when any dimension is
+// symbolic or unknown.
+//
+// `None` and not zero.  A zero-element tensor is a real thing — an
+// empty batch — and answering zero for "I do not know" would make a
+// caller allocate nothing for a model that needed everything.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     match onnxtype.element_count(onnxtype.fixed_shape([2, 3]))
+//         Some(n) => println("${n}")            // 6
+//         None    => println("not fully known")
+// ```
+pub fn element_count(s: OnnxShape) -> ?Int []
+    todo("onnx-nv.onnxtype.element_count")
+
+// Every symbolic dimension name in the shape, in order, without
+// repeats.
+//
+// What a serving stack collects to find out which models can share a
+// batch, and what a shape checker unifies over.
+//
+// ```novo
+// use std.list
+// use onnxtype
+//
+// fn main() [io]
+//     let s = onnxtype.shape([OnnxDimParam("batch"), OnnxDimValue(3),
+//                             OnnxDimParam("batch")])
+//     println("${list.len(onnxtype.symbols_of(s))}")   // 1
+// ```
+pub fn symbols_of(s: OnnxShape) -> [Str] []
+    todo("onnx-nv.onnxtype.symbols_of")
+
+// The shape with every occurrence of a named dimension replaced by a
+// number.
+//
+// What a serving stack does when the batch size is finally known.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     let s = onnxtype.shape([OnnxDimParam("batch"), OnnxDimValue(3)])
+//     println("${onnxtype.is_fully_known(onnxtype.bind_symbol(s, "batch", 8))}")
+// ```
+pub fn bind_symbol(s: OnnxShape, name: Str, size: Int) -> OnnxShape []
+    todo("onnx-nv.onnxtype.bind_symbol")
+
+// A tensor from its parts.
+//
+// ```novo
+// use std.bytes
+// use onnxtype
+//
+// fn main() [io]
+//     let t = onnxtype.tensor("W", OnnxFloat, [2, 3], bytes.zeros(24))
+//     println("${t.name}")                      // W
+// ```
+pub fn tensor(name: Str, data_type: OnnxDataType, dims: [Int], raw: Bytes) -> OnnxTensor []
+    todo("onnx-nv.onnxtype.tensor")
+
+// How many elements the tensor holds, from its dimensions.
+//
+// ```novo
+// use std.bytes
+// use onnxtype
+//
+// fn main() [io]
+//     let t = onnxtype.tensor("W", OnnxFloat, [2, 3], bytes.zeros(24))
+//     println("${onnxtype.tensor_element_count(t)}")   // 6
+// ```
+pub fn tensor_element_count(t: OnnxTensor) -> Int []
+    todo("onnx-nv.onnxtype.tensor_element_count")
+
+// How many bytes the tensor's data should occupy: elements times
+// element width.
+//
+// Compared against `bytes.len(t.raw)` by `onnxcheck`, and the
+// comparison that catches a model truncated in transit.
+//
+// ```novo
+// use std.bytes
+// use onnxtype
+//
+// fn main() [io]
+//     let t = onnxtype.tensor("W", OnnxFloat, [2, 3], bytes.zeros(24))
+//     println("${onnxtype.tensor_byte_length(t)}")   // 24
+// ```
+pub fn tensor_byte_length(t: OnnxTensor) -> Int []
+    todo("onnx-nv.onnxtype.tensor_byte_length")
+
+// Whether the tensor's data lives in a separate file.
+//
+// True for any weight above the two-gigabyte protobuf ceiling, which
+// is every large model.  `onnxio.attach_external` is what a caller
+// that has read the file calls.
+//
+// ```novo
+// use std.bytes
+// use onnxtype
+//
+// fn main() [io]
+//     let t = onnxtype.tensor("W", OnnxFloat, [2, 3], bytes.zeros(24))
+//     println("${onnxtype.is_external(t)}")     // false
+// ```
+pub fn is_external(t: OnnxTensor) -> Bool []
+    todo("onnx-nv.onnxtype.is_external")
+
+// A value info from its parts.
+//
+// ```novo
+// use onnxtype
+//
+// fn main() [io]
+//     let v = onnxtype.value_info("x", OnnxFloat,
+//                                 onnxtype.shape([OnnxDimParam("batch")]))
+//     println(v.name)                           // x
+// ```
+pub fn value_info(name: Str, elem_type: OnnxDataType, shape: OnnxShape) -> OnnxValueInfo []
+    todo("onnx-nv.onnxtype.value_info")

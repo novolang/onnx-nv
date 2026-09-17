@@ -1,0 +1,55 @@
+[package]
+name        = "onnx-nv"
+version     = "0.0.1"
+description = "The ONNX model format as typed values: a graph of nodes, attributes, initializers and value infos read from protobuf by field number, shapes whose dimensions are a number or a named symbol, a carried operator-set table with each operator's since-version and input and output arity, validation that answers findings rather than a verdict, and a writer that preserves the fields it does not know.  Execution belongs elsewhere.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  A model's bytes arrive from the caller and the graph leaves
+# as a value: nothing here opens a file, allocates a device buffer or
+# runs a kernel.  RUNNING a model is `libonnxruntime-sys`'s, which is
+# layer `sys`, and a `core` package may not depend on one — which is
+# the layer rule stating the same division this package's README does.
+layer       = "core"
+
+category    = "ai"
+
+tags        = ["onnx", "model", "graph", "protobuf", "opset", "inference", "tensor", "ml"]
+repository  = "https://github.com/novolang/onnx-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The ONNX graph read into typed values over protobuf-nv"
+
+[dependencies]
+# protobuf-nv is what an ONNX file IS: `onnx.proto` compiled, and
+# nothing else.  This package reads it with protobuf-nv's LOW-LEVEL
+# surface — `pbwire`'s tag and varint arithmetic, `pbread.walk`'s
+# events, `pbunknown`'s keeping of fields it does not know — and NOT
+# with `pbdyn`.
+#
+# `pbdyn` addresses a message by field number through a `PbFileSet`,
+# which is a compiled descriptor set.  Using it would mean carrying
+# `onnx.proto`'s descriptor as a blob in this package, keeping that
+# blob in step with every ONNX release, and paying a schema lookup for
+# every field of every node in a graph that can hold a hundred
+# thousand of them.  ONNX's message shapes are fixed, small and
+# versioned by `ir_version`, so reading them by field number directly
+# is both faster and the honest description of what is happening.
+#
+# `pbunknown` is the part that matters for the WRITER: a field this
+# package does not know is kept and written back, so a round trip
+# through a newer ONNX does not silently delete it.
+#
+# `core`, so the layer rule holds.  `^0.0.1` pins exactly 0.0.1.
+protobuf-nv = "^0.0.1"

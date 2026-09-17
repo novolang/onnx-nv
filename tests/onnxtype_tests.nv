@@ -1,0 +1,177 @@
+// onnxtype_tests.nv — element types, and shapes whose dimensions may
+// be names, against `onnx.proto`'s `TensorProto.DataType` and
+// `TensorShapeProto`.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: onnx-nv.onnxtype.<fn>`.
+
+use std.test
+use std.list
+use std.bytes
+use std.str
+use onnxfault
+use onnxtype
+
+@test
+fn test_the_seventeen_data_type_codes() [io]
+    // `TensorProto.DataType`, in the order onnx.proto declares them.
+    test.case("the ones every model uses")
+    test.assert(onnxtype.type_code(OnnxUndefined) == 0)
+    test.assert(onnxtype.type_code(OnnxFloat) == 1)
+    test.assert(onnxtype.type_code(OnnxInt32) == 6)
+    test.assert(onnxtype.type_code(OnnxInt64) == 7)
+    test.assert(onnxtype.type_code(OnnxString) == 8)
+    test.assert(onnxtype.type_code(OnnxFloat16) == 10)
+    test.assert(onnxtype.type_code(OnnxDouble) == 11)
+    test.assert(onnxtype.type_code(OnnxBfloat16) == 16)
+
+    test.case("a code round trips")
+    match onnxtype.type_of_code(7)
+        Ok(t)  => test.assert(onnxtype.type_name(t) == "INT64")
+        Err(e) => test.fail(e.message())
+
+    test.case("and one outside 0 to 16 is refused")
+    match onnxtype.type_of_code(99)
+        Ok(_)  => test.fail("there are seventeen")
+        Err(e) => test.assert(onnxfault.code(e) == "unknown_data_type")
+
+    test.case("the names are onnx.proto's own spelling")
+    test.assert(onnxtype.type_name(OnnxBfloat16) == "BFLOAT16")
+    test.assert(onnxtype.type_name(OnnxComplex64) == "COMPLEX64")
+    test.assert(onnxtype.type_name(OnnxUint8) == "UINT8")
+
+@test
+fn test_element_widths_and_what_has_none() [io]
+    test.case("the fixed widths")
+    test.assert(onnxtype.element_bytes(OnnxInt8) == 1)
+    test.assert(onnxtype.element_bytes(OnnxBool) == 1)
+    test.assert(onnxtype.element_bytes(OnnxFloat16) == 2)
+    test.assert(onnxtype.element_bytes(OnnxBfloat16) == 2)
+    test.assert(onnxtype.element_bytes(OnnxFloat) == 4)
+    test.assert(onnxtype.element_bytes(OnnxInt64) == 8)
+    test.assert(onnxtype.element_bytes(OnnxComplex64) == 8)
+    test.assert(onnxtype.element_bytes(OnnxComplex128) == 16)
+
+    test.case("a string and an undefined type have no fixed width")
+    test.assert(onnxtype.element_bytes(OnnxString) == 0)
+    test.assert(onnxtype.element_bytes(OnnxUndefined) == 0)
+
+    test.case("the complex types are floating point, because their parts are")
+    test.assert(onnxtype.is_float(OnnxFloat))
+    test.assert(onnxtype.is_float(OnnxBfloat16))
+    test.assert(onnxtype.is_float(OnnxComplex64))
+    test.assert(not onnxtype.is_float(OnnxInt64))
+    test.assert(not onnxtype.is_float(OnnxString))
+
+@test
+fn test_a_dimension_is_a_number_or_a_name_and_the_name_survives() [io]
+    // `batch` is on every input of every model exported for serving.
+    // A library that flattened it to zero has thrown away the thing
+    // the consumer needed.
+    test.case("the three cases print differently")
+    test.assert(onnxtype.dim_text(OnnxDimValue(224)) == "224")
+    test.assert(onnxtype.dim_text(OnnxDimParam("batch")) == "batch")
+    test.assert(onnxtype.dim_text(OnnxDimUnknown) == "?")
+
+    test.case("a shape knows its rank")
+    test.assert(onnxtype.rank(onnxtype.fixed_shape([1, 3, 224, 224])) == 4)
+    test.assert(onnxtype.rank(onnxtype.shape([])) == 0)
+
+    test.case("a fully fixed shape says so; one with a name does not")
+    test.assert(onnxtype.is_fully_known(onnxtype.fixed_shape([1, 3, 224, 224])))
+    test.assert(not onnxtype.is_fully_known(
+        onnxtype.shape([OnnxDimParam("batch"), OnnxDimValue(3)])))
+    test.assert(not onnxtype.is_fully_known(onnxtype.shape([OnnxDimUnknown])))
+
+    test.case("and the text is the whole shape")
+    test.assert(str.contains(onnxtype.shape_text(
+        onnxtype.shape([OnnxDimParam("batch"), OnnxDimValue(3)])),
+        "batch"))
+
+@test
+fn test_an_unknown_element_count_is_none_and_not_zero() [io]
+    // A zero-element tensor is a real thing — an empty batch — and
+    // answering zero for "I do not know" would make a caller allocate
+    // nothing for a model that needed everything.
+    test.case("a fixed shape counts")
+    match onnxtype.element_count(onnxtype.fixed_shape([2, 3]))
+        Some(n) => test.assert(n == 6)
+        None    => test.fail("that shape is fully known")
+
+    test.case("a rank-zero shape holds one element, which is a scalar")
+    match onnxtype.element_count(onnxtype.shape([]))
+        Some(n) => test.assert(n == 1)
+        None    => test.fail("a scalar is fully known")
+
+    test.case("a genuinely empty tensor counts zero")
+    match onnxtype.element_count(onnxtype.fixed_shape([0, 3]))
+        Some(n) => test.assert(n == 0)
+        None    => test.fail("that shape is fully known")
+
+    test.case("and a symbolic one answers None, which is a different answer")
+    match onnxtype.element_count(onnxtype.shape([OnnxDimParam("batch")]))
+        Some(_) => test.fail("the batch size is not known")
+        None    => test.assert(true)
+
+@test
+fn test_two_dimensions_with_the_same_name_are_the_same_unknown() [io]
+    // The fact a shape checker is built on, and the fact an integer
+    // cannot carry.
+    test.case("a repeated symbol appears once in the list")
+    let s = onnxtype.shape([OnnxDimParam("batch"), OnnxDimValue(3),
+                            OnnxDimParam("batch")])
+    test.assert(list.len(onnxtype.symbols_of(s)) == 1)
+    test.assert(list.get(onnxtype.symbols_of(s), 0) == "batch")
+
+    test.case("two different symbols are two")
+    let t = onnxtype.shape([OnnxDimParam("batch"), OnnxDimParam("sequence")])
+    test.assert(list.len(onnxtype.symbols_of(t)) == 2)
+
+    test.case("a fully fixed shape has none")
+    test.assert(list.len(onnxtype.symbols_of(onnxtype.fixed_shape([1, 3]))) == 0)
+
+    test.case("binding a symbol replaces EVERY occurrence of it")
+    let bound = onnxtype.bind_symbol(s, "batch", 8)
+    test.assert(onnxtype.is_fully_known(bound))
+    match onnxtype.element_count(bound)
+        Some(n) => test.assert(n == 192)
+        None    => test.fail("it is bound now")
+
+    test.case("and binding a name that is not there changes nothing")
+    test.assert(not onnxtype.is_fully_known(
+        onnxtype.bind_symbol(s, "sequence", 8)))
+
+@test
+fn test_a_tensor_keeps_its_bytes_raw() [io]
+    // A four-gigabyte weight decoded into a [Float] is four gigabytes
+    // of boxed numbers, and the caller that wanted it wanted it in a
+    // buffer it chose.
+    test.case("a tensor carries its type, its dims and its bytes")
+    let t = onnxtype.tensor("W", OnnxFloat, [2, 3], bytes.zeros(24))
+    test.assert(t.name == "W")
+    test.assert(onnxtype.type_name(t.data_type) == "FLOAT")
+    test.assert(bytes.len(t.raw) == 24)
+
+    test.case("its element count is the product of its dims")
+    test.assert(onnxtype.tensor_element_count(t) == 6)
+
+    test.case("and its byte length is that times the element width")
+    test.assert(onnxtype.tensor_byte_length(t) == 24)
+
+    test.case("a scalar tensor has one element")
+    test.assert(onnxtype.tensor_element_count(
+        onnxtype.tensor("s", OnnxFloat, [], bytes.zeros(4))) == 1)
+
+    test.case("a tensor built here is not external")
+    test.assert(not onnxtype.is_external(t))
+
+@test
+fn test_a_value_info_pairs_a_name_with_a_declared_type() [io]
+    test.case("what a graph input is")
+    let v = onnxtype.value_info("x", OnnxFloat,
+                                onnxtype.shape([OnnxDimParam("batch"),
+                                                OnnxDimValue(3)]))
+    test.assert(v.name == "x")
+    test.assert(onnxtype.type_name(v.elem_type) == "FLOAT")
+    test.assert(onnxtype.rank(v.shape) == 2)
+    test.assert(not onnxtype.is_fully_known(v.shape))

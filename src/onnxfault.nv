@@ -1,0 +1,141 @@
+// onnxfault.nv — why a model could not be read, written or trusted.
+//
+// READING AND CHECKING ARE DIFFERENT FAILURES AND ARE KEPT APART
+//
+// A model that is not a protobuf message cannot be read, and there is
+// nothing to hand back.  A model that reads perfectly and uses an
+// operator at an opset version that does not have it is a MODEL THAT
+// LOADED, and handing back nothing for it would be refusing to show a
+// user the graph that is wrong.
+//
+// So the refusals here are reading and writing failures, `onnxcheck`
+// answers a list of findings, and the two are never mixed: `read`
+// answers `Result<OnnxModel, OnnxFault>` and `check` answers
+// `[OnnxFinding]` over a model that already exists.
+//
+// A REFUSAL NAMES THE MESSAGE IT WAS IN
+//
+// An ONNX file is a tree of protobuf messages, and "invalid wire type"
+// with no more is useless on a file with a hundred thousand nodes.
+// Every refusal here carries the byte offset and, where it is known,
+// the node's name — which ONNX allows to be empty, so the index is
+// carried too.
+
+// Why a model could not be read or written.
+//
+// ```novo
+// use onnxfault
+//
+// fn main() [io]
+//     println(OnnxNoGraph.message())
+// ```
+pub enum OnnxFault
+    // The bytes are not a protobuf message at all.  Carries
+    // protobuf-nv's own reason, because it is more specific than
+    // anything this package could say.
+    OnnxNotProtobuf(offset: Int, reason: PbDecodeError)
+    // A field's wire type is not the one `onnx.proto` gives it.
+    OnnxWrongWireType(offset: Int, field: Int, found: Int, expected: Int)
+    // The model has no graph.  `ModelProto.graph` is optional in the
+    // schema and required in practice: a model without one cannot be
+    // run, converted or checked.
+    OnnxNoGraph
+    // The `ir_version` is newer than this package understands.  The
+    // number is carried so a caller can say which release it needs.
+    OnnxIrVersionTooNew(found: Int, supported: Int)
+    // A tensor's `data_type` is not one of the sixteen
+    // `TensorProto.DataType` defines.
+    OnnxUnknownDataType(code: Int)
+    // A tensor's element count does not match the product of its
+    // dimensions.
+    OnnxTensorSizeMismatch(name: Str, declared: Int, from_dims: Int)
+    // A tensor whose data lives in a separate file, named by
+    // `external_data`.  NOT a corrupt model: it is how ONNX stores
+    // weights above the two-gigabyte protobuf ceiling, and it is the
+    // ordinary shape of any large language model.  A `core` package
+    // cannot open the file, so the refusal carries the location and a
+    // caller reads it and calls `onnxio.attach_external`.
+    OnnxExternalData(name: Str, location: Str)
+    // A graph whose nodes do not form a directed acyclic graph.
+    OnnxGraphHasCycle(node_index: Int, name: Str)
+    // A string field that is not valid UTF-8.  ONNX says its strings
+    // are UTF-8; some exporters have written raw bytes.
+    OnnxBadUtf8(offset: Int, field: Int)
+    // A message nested deeper than this reader will go.  A bound
+    // against a crafted file: protobuf nesting is unbounded and a
+    // recursive reader is a stack overflow waiting for one.
+    OnnxTooDeep(limit: Int)
+    // A message larger than the ceiling the caller set.
+    OnnxTooLarge(bytes: Int, limit: Int)
+    // A caller asked to write an attribute whose value does not match
+    // its declared type.
+    OnnxAttributeTypeMismatch(node: Str, name: Str, declared: Str, given: Str)
+    // A caller asked to write a model with no opset import.  Every
+    // ONNX model must declare at least the default domain's version,
+    // and one that does not cannot be loaded by anything.
+    OnnxNoOpsetImport
+
+// `OnnxFault` is an `Error`, which is what lets `Result<T, OnnxFault>`
+// exist at all.
+impl Error for OnnxFault
+    // The one-line message, naming the offset and the field.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("onnx-nv.OnnxFault.message")
+
+// The byte offset the refusal is about, or `-1` when it is about the
+// model as a whole.
+//
+// ```novo
+// use onnxfault
+//
+// fn main() [io]
+//     println("${onnxfault.offset_of(OnnxNoGraph)}")   // -1
+// ```
+pub fn offset_of(f: OnnxFault) -> Int []
+    todo("onnx-nv.onnxfault.offset_of")
+
+// A short stable code for logs: `"no_graph"`, `"external_data"`,
+// `"ir_version_too_new"`, and so on.
+//
+// ```novo
+// use onnxfault
+//
+// fn main() [io]
+//     println(onnxfault.code(OnnxNoGraph))      // no_graph
+// ```
+pub fn code(f: OnnxFault) -> Str []
+    todo("onnx-nv.onnxfault.code")
+
+// Whether the model is well formed and the caller simply cannot
+// finish loading it here.
+//
+// TRUE FOR `OnnxExternalData` ALONE, and that is why the predicate
+// exists.  A model whose weights live beside it in a `.onnx.data` file
+// is not broken — it is every large model, because protobuf cannot
+// hold more than two gigabytes — and a caller that treated the refusal
+// as corruption would reject exactly the models people care about.
+// The right response is to read the named file and call
+// `onnxio.attach_external`.
+//
+// ```novo
+// use onnxfault
+//
+// fn main() [io]
+//     println("${onnxfault.needs_external_file(OnnxExternalData("w", "model.data"))}")
+//     println("${onnxfault.needs_external_file(OnnxNoGraph)}")   // false
+// ```
+pub fn needs_external_file(f: OnnxFault) -> Bool []
+    todo("onnx-nv.onnxfault.needs_external_file")
+
+// The external file a refusal names, or `""`.
+//
+// ```novo
+// use onnxfault
+//
+// fn main() [io]
+//     println(onnxfault.external_location(OnnxExternalData("w", "model.data")))
+// ```
+pub fn external_location(f: OnnxFault) -> Str []
+    todo("onnx-nv.onnxfault.external_location")

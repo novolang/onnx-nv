@@ -1,0 +1,287 @@
+// onnxio.nv — bytes in, a model out; a model in, bytes out.
+//
+// READING BY FIELD NUMBER, NOT THROUGH A DESCRIPTOR
+//
+// An ONNX file is `onnx.proto` compiled, and nothing else.  There are
+// two ways to read one with protobuf-nv: through `pbdyn`, which
+// addresses a message by field number through a compiled descriptor
+// set; or through `pbwire` and `pbread`, which are the tag arithmetic
+// and the event walk.
+//
+// This package uses the second.  `pbdyn` would mean carrying
+// `onnx.proto`'s descriptor as a blob, keeping that blob in step with
+// every ONNX release, and paying a schema lookup for every field of
+// every node in a graph that can hold a hundred thousand of them.
+// ONNX's message shapes are fixed, small, and versioned by
+// `ir_version`, so reading them by field number directly is faster and
+// is the honest description of what is happening.
+//
+// WHAT IS NOT UNDERSTOOD IS KEPT
+//
+// `pbunknown` holds every field this package does not model, and
+// `write` puts them back.  A model written by a newer ONNX, round
+// tripped through this package, comes out with its newer fields
+// intact — which is the difference between a tool people trust with
+// their weights and one they do not.
+//
+// THE TWO-GIGABYTE WALL
+//
+// Protobuf cannot encode a message larger than two gigabytes, and
+// model weights passed that years ago.  ONNX's answer is
+// `external_data`: the tensor's message carries a FILE NAME and an
+// offset, and the bytes live beside the model.
+//
+// A `core` package cannot open that file.  So `read` answers
+// `OnnxExternalData` naming the location, `onnxfault.needs_external_file`
+// identifies it, and `attach_external` is what a caller that has read
+// the bytes calls.  Refusing outright would be refusing exactly the
+// models people care about; pretending the tensor is empty would be
+// worse.
+
+use onnxfault
+use onnxgraph
+
+// How far a read will go before it refuses.
+pub struct OnnxReadLimits
+    // How deeply messages may nest.  Protobuf nesting is unbounded and
+    // a recursive reader meeting a crafted file is a stack overflow.
+    max_depth: Int
+    // How many bytes the whole message may be.
+    max_bytes: Int
+    // How many nodes a graph may hold.
+    max_nodes: Int
+    // Whether to read tensor data at all.  False reads the shapes,
+    // the types and the names and SKIPS the weights — which is most of
+    // a model's bytes and none of what a tool inspecting its structure
+    // needs.
+    read_tensor_data: Bool
+
+// The ordinary limits: 64 deep, two gigabytes, a million nodes,
+// weights read.
+//
+// ```novo
+// use onnxio
+//
+// fn main() [io]
+//     println("${onnxio.default_limits().max_depth}")   // 64
+// ```
+pub fn default_limits() -> OnnxReadLimits []
+    todo("onnx-nv.onnxio.default_limits")
+
+// The limits that read the structure and skip the weights.
+//
+// WHAT AN INSPECTION TOOL WANTS.  A model's weights are almost all of
+// its bytes and none of what a tool listing its operators, checking
+// its opset or drawing its graph needs, and skipping them turns a
+// four-gigabyte read into a four-megabyte one.
+//
+// ```novo
+// use onnxio
+//
+// fn main() [io]
+//     println("${onnxio.structure_only().read_tensor_data}")   // false
+// ```
+pub fn structure_only() -> OnnxReadLimits []
+    todo("onnx-nv.onnxio.structure_only")
+
+// The same limits with a different depth ceiling.
+//
+// ```novo
+// use onnxio
+//
+// fn main() [io]
+//     println("${onnxio.with_max_depth(onnxio.default_limits(), 8).max_depth}")   // 8
+// ```
+pub fn with_max_depth(l: OnnxReadLimits, n: Int) -> OnnxReadLimits []
+    todo("onnx-nv.onnxio.with_max_depth")
+
+// The same limits with a different byte ceiling.
+//
+// ```novo
+// use onnxio
+//
+// fn main() [io]
+//     println("${onnxio.with_max_bytes(onnxio.default_limits(), 1024).max_bytes}")
+// ```
+pub fn with_max_bytes(l: OnnxReadLimits, n: Int) -> OnnxReadLimits []
+    todo("onnx-nv.onnxio.with_max_bytes")
+
+// The model these bytes hold.
+//
+// ```novo
+// use std.bytes
+// use onnxio
+//
+// fn main() [io]
+//     match onnxio.read(bytes.zeros(0), onnxio.default_limits())
+//         Ok(_)  => println("an empty message is a model with no graph")
+//         Err(e) => println(e.message())
+// ```
+pub fn read(src: Bytes, limits: OnnxReadLimits) -> Result<OnnxModel, OnnxFault> []
+    todo("onnx-nv.onnxio.read")
+
+// The model's header without its graph: the IR version, the opset
+// imports, the producer.
+//
+// THE CHEAPEST USEFUL QUESTION.  Whether a runtime can load a model at
+// all is decided by the opset imports, and they are the first few
+// hundred bytes of the file.  A serving stack screening an upload
+// reads this and stops.
+//
+// ```novo
+// use std.bytes
+// use onnxio
+//
+// fn main() [io]
+//     match onnxio.read_header(bytes.zeros(0))
+//         Ok(m)  => println("${m.ir_version}")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_header(src: Bytes) -> Result<OnnxModel, OnnxFault> []
+    todo("onnx-nv.onnxio.read_header")
+
+// Whether these bytes look like an ONNX model.
+//
+// A protobuf message has no magic number, so this is a heuristic and
+// says so: the first field of `ModelProto` is `ir_version`, a varint at
+// field 1, and a file that does not start with that tag is not an ONNX
+// model.  It can be fooled by another protobuf whose first field is
+// also a varint at field 1, and a caller that needs certainty reads
+// the header.
+//
+// ```novo
+// use std.bytes
+// use onnxio
+//
+// fn main() [io]
+//     println("${onnxio.looks_like_onnx(bytes.from_byte_list([0x08, 0x08]))}")
+// ```
+pub fn looks_like_onnx(src: Bytes) -> Bool []
+    todo("onnx-nv.onnxio.looks_like_onnx")
+
+// The model as bytes.
+//
+// Every field this package did not model is written back from
+// `unknown`, so a round trip through a newer ONNX keeps its newer
+// fields.
+//
+// ```novo
+// use std.bytes
+// use onnxgraph
+// use onnxio
+//
+// fn main() [io]
+//     match onnxio.write(onnxgraph.empty_model())
+//         Ok(out) => println("${bytes.len(out) >= 0}")
+//         Err(e)  => println(e.message())
+// ```
+pub fn write(m: OnnxModel) -> Result<Bytes, OnnxFault> []
+    todo("onnx-nv.onnxio.write")
+
+// How many bytes `write` would produce, without producing them.
+//
+// The number that says whether a model will still fit under
+// protobuf's two-gigabyte ceiling after an edit, which is the check a
+// tool that adds a node has to make before it tries.
+//
+// ```novo
+// use onnxgraph
+// use onnxio
+//
+// fn main() [io]
+//     match onnxio.encoded_len(onnxgraph.empty_model())
+//         Ok(n)  => println("${n >= 0}")
+//         Err(e) => println(e.message())
+// ```
+pub fn encoded_len(m: OnnxModel) -> Result<Int, OnnxFault> []
+    todo("onnx-nv.onnxio.encoded_len")
+
+// Whether the model would exceed protobuf's two-gigabyte message
+// ceiling.
+//
+// True for any real large model, which is why `external_data` exists.
+//
+// ```novo
+// use onnxgraph
+// use onnxio
+//
+// fn main() [io]
+//     println("${onnxio.exceeds_protobuf_limit(onnxgraph.empty_model())}")   // false
+// ```
+pub fn exceeds_protobuf_limit(m: OnnxModel) -> Bool []
+    todo("onnx-nv.onnxio.exceeds_protobuf_limit")
+
+// The model with one external tensor's bytes supplied.
+//
+// WHAT A CALLER THAT READ THE FILE CALLS.  A `core` package cannot
+// open `model.onnx.data`, so `read` answers `OnnxExternalData` naming
+// it, the caller spends its own `[fs]` once, and this puts the bytes
+// where they belong.
+//
+// ```novo
+// use std.bytes
+// use onnxgraph
+// use onnxio
+//
+// fn main() [io]
+//     match onnxio.attach_external(onnxgraph.empty_model(), "W", bytes.zeros(4))
+//         Ok(_)  => println("attached")
+//         Err(e) => println(e.message())
+// ```
+pub fn attach_external(m: OnnxModel, tensor_name: Str,
+                       data: Bytes) -> Result<OnnxModel, OnnxFault> []
+    todo("onnx-nv.onnxio.attach_external")
+
+// Every external file the model refers to, without repeats.
+//
+// The list a caller reads before it starts: one pass over the model
+// tells it which files to open, instead of one refusal at a time.
+//
+// ```novo
+// use std.list
+// use onnxgraph
+// use onnxio
+//
+// fn main() [io]
+//     println("${list.len(onnxio.external_files(onnxgraph.empty_model()))}")   // 0
+// ```
+pub fn external_files(m: OnnxModel) -> [Str] []
+    todo("onnx-nv.onnxio.external_files")
+
+// The model with its large initializers moved OUT into an external
+// file's worth of bytes.
+//
+// The other direction, and what a writer of a large model needs:
+// answers the model with `external_location` set on every initializer
+// above the threshold, and the concatenated bytes for the caller to
+// write beside it.
+//
+// ```novo
+// use std.bytes
+// use onnxgraph
+// use onnxio
+//
+// fn main() [io]
+//     match onnxio.externalize(onnxgraph.empty_model(), "model.onnx.data", 1024)
+//         Ok(pair) => println("${bytes.len(pair.1)}")   // 0
+//         Err(e)   => println(e.message())
+// ```
+pub fn externalize(m: OnnxModel, location: Str,
+                   threshold: Int) -> Result<(OnnxModel, Bytes), OnnxFault> []
+    todo("onnx-nv.onnxio.externalize")
+
+// protobuf-nv's limits that correspond to these.
+//
+// Public because a caller that drives protobuf-nv's reader itself —
+// to walk a model's bytes for something this package does not model —
+// should use the same ceilings, and deriving them twice is how the
+// two drift apart.
+//
+// ```novo
+// use onnxio
+//
+// fn main() [io]
+//     println("${onnxio.protobuf_limits(onnxio.default_limits()).max_depth >= 1}")
+// ```
+pub fn protobuf_limits(l: OnnxReadLimits) -> PbLimits []
+    todo("onnx-nv.onnxio.protobuf_limits")
