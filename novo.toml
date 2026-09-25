@@ -1,6 +1,6 @@
 [package]
 name        = "onnx-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The ONNX model format as typed values: a graph of nodes, attributes, initializers and value infos read from protobuf by field number, shapes whose dimensions are a number or a named symbol, a carried operator-set table with each operator's since-version and input and output arity, validation that answers findings rather than a verdict, and a writer that preserves the fields it does not know.  Execution belongs elsewhere.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
