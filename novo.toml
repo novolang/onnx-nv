@@ -1,6 +1,6 @@
 [package]
 name        = "onnx-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "The ONNX model format as typed values: a graph of nodes, attributes, initializers and value infos read from protobuf by field number, shapes whose dimensions are a number or a named symbol, a carried operator-set table with each operator's since-version and input and output arity, validation that answers findings rather than a verdict, and a writer that preserves the fields it does not know.  Execution belongs elsewhere.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -52,4 +52,4 @@ novo        = ">= 0.9.0"
 # through a newer ONNX does not silently delete it.
 #
 # `core`, so the layer rule holds.  `^0.0.1` pins exactly 0.0.1.
-protobuf-nv = "^0.0.1"
+protobuf-nv = "^0.1.0"
