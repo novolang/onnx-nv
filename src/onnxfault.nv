@@ -43,8 +43,11 @@ pub enum OnnxFault
     // The `ir_version` is newer than this package understands.  The
     // number is carried so a caller can say which release it needs.
     OnnxIrVersionTooNew(found: Int, supported: Int)
-    // A tensor's `data_type` is not one of the sixteen
-    // `TensorProto.DataType` defines.
+    // A tensor's `data_type` is not one of the codes this package
+    // models: it carries the first seventeen of `TensorProto.DataType`
+    // and refuses every later code, because the specification keeps
+    // adding them and a reader that guessed at one would misread the
+    // bytes.
     OnnxUnknownDataType(code: Int)
     // A tensor's element count does not match the product of its
     // dimensions.
@@ -79,10 +82,34 @@ pub enum OnnxFault
 // exist at all.
 impl Error for OnnxFault
     // The one-line message, naming the offset and the field.
-    //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("onnx-nv.OnnxFault.message")
+        match self
+            OnnxNotProtobuf(offset, reason)                        =>
+                "not a protobuf message at byte ${offset}: ${reason.message()}"
+            OnnxWrongWireType(offset, field, found, expected)      =>
+                "field ${field} at byte ${offset} has wire type ${found}, not ${expected}"
+            OnnxNoGraph                                            =>
+                "the model has no graph"
+            OnnxIrVersionTooNew(found, supported)                  =>
+                "ir_version ${found} is newer than the ${supported} this package understands"
+            OnnxUnknownDataType(code)                              =>
+                "tensor data type ${code} is not one of the data types this package models"
+            OnnxTensorSizeMismatch(name, declared, from_dims)      =>
+                "tensor '${name}': ${declared} byte(s) of data, but its dimensions and element type imply ${from_dims}"
+            OnnxExternalData(name, location)                       =>
+                "tensor '${name}' has its data in '${location}', which this package cannot open"
+            OnnxGraphHasCycle(node_index, name)                    =>
+                "node ${node_index} ('${name}') closes a cycle in the graph"
+            OnnxBadUtf8(offset, field)                             =>
+                "field ${field} at byte ${offset} is not UTF-8"
+            OnnxTooDeep(limit)                                     =>
+                "the message nests deeper than the limit of ${limit}"
+            OnnxTooLarge(size, limit)                              =>
+                "the model is ${size} byte(s), above the limit of ${limit}"
+            OnnxAttributeTypeMismatch(node, name, declared, given) =>
+                "attribute '${name}' of node '${node}' is declared ${declared} and holds ${given}"
+            OnnxNoOpsetImport                                      =>
+                "the model imports no operator set"
 
 // The byte offset the refusal is about, or `-1` when it is about the
 // model as a whole.
@@ -94,7 +121,11 @@ impl Error for OnnxFault
 //     println("${onnxfault.offset_of(OnnxNoGraph)}")   // -1
 // ```
 pub fn offset_of(f: OnnxFault) -> Int []
-    todo("onnx-nv.onnxfault.offset_of")
+    match f
+        OnnxNotProtobuf(offset, _)         => offset
+        OnnxWrongWireType(offset, _, _, _) => offset
+        OnnxBadUtf8(offset, _)             => offset
+        _                                  => 0 - 1
 
 // A short stable code for logs: `"no_graph"`, `"external_data"`,
 // `"ir_version_too_new"`, and so on.
@@ -106,7 +137,20 @@ pub fn offset_of(f: OnnxFault) -> Int []
 //     println(onnxfault.code(OnnxNoGraph))      // no_graph
 // ```
 pub fn code(f: OnnxFault) -> Str []
-    todo("onnx-nv.onnxfault.code")
+    match f
+        OnnxNotProtobuf(_, _)                 => "not_protobuf"
+        OnnxWrongWireType(_, _, _, _)         => "wrong_wire_type"
+        OnnxNoGraph                           => "no_graph"
+        OnnxIrVersionTooNew(_, _)             => "ir_version_too_new"
+        OnnxUnknownDataType(_)                => "unknown_data_type"
+        OnnxTensorSizeMismatch(_, _, _)       => "tensor_size_mismatch"
+        OnnxExternalData(_, _)                => "external_data"
+        OnnxGraphHasCycle(_, _)               => "graph_has_cycle"
+        OnnxBadUtf8(_, _)                     => "bad_utf8"
+        OnnxTooDeep(_)                        => "too_deep"
+        OnnxTooLarge(_, _)                    => "too_large"
+        OnnxAttributeTypeMismatch(_, _, _, _) => "attribute_type_mismatch"
+        OnnxNoOpsetImport                     => "no_opset_import"
 
 // Whether the model is well formed and the caller simply cannot
 // finish loading it here.
@@ -127,7 +171,9 @@ pub fn code(f: OnnxFault) -> Str []
 //     println("${onnxfault.needs_external_file(OnnxNoGraph)}")   // false
 // ```
 pub fn needs_external_file(f: OnnxFault) -> Bool []
-    todo("onnx-nv.onnxfault.needs_external_file")
+    match f
+        OnnxExternalData(_, _) => true
+        _                      => false
 
 // The external file a refusal names, or `""`.
 //
@@ -138,4 +184,6 @@ pub fn needs_external_file(f: OnnxFault) -> Bool []
 //     println(onnxfault.external_location(OnnxExternalData("w", "model.data")))
 // ```
 pub fn external_location(f: OnnxFault) -> Str []
-    todo("onnx-nv.onnxfault.external_location")
+    match f
+        OnnxExternalData(_, location) => location
+        _                             => ""

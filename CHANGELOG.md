@@ -5,6 +5,123 @@ All notable changes to onnx-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## Unreleased
+
+### Changed
+
+- Internal: the `elif` ladders over a protobuf field number are `match` expressions, and the cycle search holds its node as an optional. No public signature changed.
+
+## 0.1.0 — 2026-10-12
+
+**Every body is implemented, and every test is green.** The interface
+is the one 0.0.1 published, unchanged; this release is that interface
+made to work, against the suite in `tests/`, which was written first
+and asserts `onnx.proto`'s own field numbers and the operator
+specification's own version history.
+
+### Added
+
+- **The reader**: `onnxio.read`, `onnxio.read_header` and
+  `onnxio.structure_only`. It is ONE reader with three settings.
+  `read_header` decodes the header and steps over the graph,
+  `structure_only` decodes the graph and steps over the tensor data,
+  and `read` decodes everything. Fields are addressed by field number
+  over protobuf-nv's low-level surface — the tag arithmetic, the event
+  walk, the set of unknown fields — and never through a compiled
+  descriptor set, because ONNX's message shapes are fixed and a graph
+  can hold a hundred thousand nodes.
+- **The writer**: `onnxio.write`, with `encoded_len` and
+  `exceeds_protobuf_limit` beside it. A field of `ModelProto` this
+  package does not model is KEPT when the file is read and written back
+  out, so a model from a newer ONNX — a `TrainingInfoProto`, a metadata
+  entry, a field that did not exist when this was written — survives a
+  round trip with those fields intact.
+- **The external-data path, end to end.** A tensor whose bytes live
+  beside the model is refused as `external_data` with its location
+  kept, and `onnxio.attach_external` takes the bytes the caller read
+  and gives back the model with that tensor's data in it. Bytes whose
+  length disagrees with the tensor's own declaration are refused as
+  `tensor_size_mismatch`, so the length the model states is checked
+  against the length supplied rather than trusted.
+- **`tests/onnx_edge_tests.nv`**, the supplement: it builds protobuf by
+  hand — one repeated field in all the spellings the wire allows,
+  packed and unpacked, fixed32 and fixed64 and varint — and asserts the
+  reader against the wire rather than against the writer, which is what
+  catches a reader and a writer that agree with each other and with
+  nothing else.
+
+### Changed
+
+- The `novo` floor moves from `>= 0.9.0` to `>= 0.20.2`, the compiler
+  this release was built and tested with. A floor under a `todo()`
+  proves nothing about a body, and the bodies are what changed.
+- The version moves to 0.1.0 and the release is recorded
+  `stability = "experimental"`, which is what a first working release
+  is. The API suite's header now states that the tests are green and
+  that they came first.
+- The README's implementation-status section is gone, and the two rules
+  the implementation settled are stated instead: which unknown fields
+  survive a round trip (the model's own), and what a sparse-tensor
+  attribute is here (bytes that round trip, not a tensor anything
+  interprets).
+
+### Fixed
+
+Two bugs the new edge tests found in this release's own implementation
+before it shipped.
+
+- **The main graph's slot.** Subgraphs are pushed onto the flat table
+  as they are met while reading, so the main graph — pushed when its
+  own read finished — landed behind them, and `OnnxModel.main` (`0`)
+  named a subgraph. The main graph's place is now taken before its
+  nodes are read.
+- **`onnxgraph.nodes_in_order`** called a graph sorted when a node's
+  input was produced anywhere at all, so a node consuming a name
+  produced LATER was called sorted and `topological_order` returned an
+  order that was not one. It now uses the same first-producer-wins rule
+  `producer_of` does, and the two agree.
+
+### Known
+
+- **Reading does not validate the graph.** A node that consumes a name
+  nothing produces is read without complaint, because deciding that is
+  a question about the whole model and the reader answers questions
+  about one message at a time. `onnxcheck.check` reports it — the
+  finding's code is `dangling_input` and `onnxcheck.dangling_inputs`
+  lists the names — and that report is an approximation by
+  construction: the flat subgraph table does not record which graph
+  encloses which, so a subgraph is allowed its own names and the MAIN
+  graph's, and a name supplied by an outer SUBGRAPH is reported as
+  dangling.
+- **The unknown-field set is the model's own.** A field this package
+  does not model inside a node, a graph, an opset import, an attribute
+  or a tensor is stepped over when read and is not kept. Only
+  `ModelProto`'s unknown fields survive a round trip.
+- **`read_header` keeps neither the graph nor the unknown fields.**
+  That is what makes it cheap: it answers a model with a blank main
+  graph and an empty unknown set, and nothing refuses a write of one,
+  so a model read this way and written back is a model with an empty
+  graph.
+- **`structure_only` keeps no tensor bytes.** The tensors it produces
+  carry their names, shapes and types and no data, and a write of such
+  a model emits tensors with no data. Nothing refuses it, and nothing
+  can: the model does not record how it was read.
+- **The operator table is a snapshot** — the default domain to opset
+  21 and `ai.onnx.ml` to opset 5. A model importing a newer one still
+  READS; `onnxcheck` is what reports that the table cannot speak for
+  it.
+- **An attribute's declared `type` above 12 is dropped.** ONNX's
+  `AttributeType` numbers `SPARSE_TENSORS` 12, `TYPE_PROTO` 13 and
+  `TYPE_PROTOS` 14; this package's table stops at 12, so an attribute
+  declaring one of those reads with its declaration `UNDEFINED` and the
+  `type` field is not written back. The value field itself —
+  `tp`/`type_protos`/`sparse_tensor`/`sparse_tensors`, key and length
+  included — is kept byte for byte as `OnnxAttrRaw`.
+- **A string that contains a NUL is truncated when it is read as
+  text.** The reader refuses bytes that are not UTF-8 in a message's
+  text fields, but `bytes.to_str` stops at the first NUL, and a
+  `string_data` element is kept raw either way.
+
 ## 0.0.3 — 2026-09-28
 
 The dependency ranges move to the dependencies' current releases.  A

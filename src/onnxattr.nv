@@ -136,7 +136,20 @@ pub struct OnnxAttribute
 //     println("${onnxattr.kind_code(OnnxAttrKindGraph)}")   // 5
 // ```
 pub fn kind_code(k: OnnxAttrKind) -> Int []
-    todo("onnx-nv.onnxattr.kind_code")
+    match k
+        OnnxAttrKindUndefined    => 0
+        OnnxAttrKindFloat        => 1
+        OnnxAttrKindInt          => 2
+        OnnxAttrKindString       => 3
+        OnnxAttrKindTensor       => 4
+        OnnxAttrKindGraph        => 5
+        OnnxAttrKindFloats       => 6
+        OnnxAttrKindInts         => 7
+        OnnxAttrKindStrings      => 8
+        OnnxAttrKindTensors      => 9
+        OnnxAttrKindGraphs       => 10
+        OnnxAttrKindSparseTensor => 11
+        OnnxAttrKindTypeProto    => 12
 
 // The kind a code names, or `OnnxAttrKindUndefined`.
 //
@@ -151,7 +164,21 @@ pub fn kind_code(k: OnnxAttrKind) -> Int []
 //     println(onnxattr.kind_name(onnxattr.kind_of_code(99)))   // UNDEFINED
 // ```
 pub fn kind_of_code(code: Int) -> OnnxAttrKind []
-    todo("onnx-nv.onnxattr.kind_of_code")
+    match code
+        0  => OnnxAttrKindUndefined
+        1  => OnnxAttrKindFloat
+        2  => OnnxAttrKindInt
+        3  => OnnxAttrKindString
+        4  => OnnxAttrKindTensor
+        5  => OnnxAttrKindGraph
+        6  => OnnxAttrKindFloats
+        7  => OnnxAttrKindInts
+        8  => OnnxAttrKindStrings
+        9  => OnnxAttrKindTensors
+        10 => OnnxAttrKindGraphs
+        11 => OnnxAttrKindSparseTensor
+        12 => OnnxAttrKindTypeProto
+        _  => OnnxAttrKindUndefined
 
 // The kind's name as `onnx.proto` spells it: `"FLOAT"`, `"INTS"`,
 // `"GRAPH"`.
@@ -163,7 +190,20 @@ pub fn kind_of_code(code: Int) -> OnnxAttrKind []
 //     println(onnxattr.kind_name(OnnxAttrKindInts))   // INTS
 // ```
 pub fn kind_name(k: OnnxAttrKind) -> Str []
-    todo("onnx-nv.onnxattr.kind_name")
+    match k
+        OnnxAttrKindUndefined    => "UNDEFINED"
+        OnnxAttrKindFloat        => "FLOAT"
+        OnnxAttrKindInt          => "INT"
+        OnnxAttrKindString       => "STRING"
+        OnnxAttrKindTensor       => "TENSOR"
+        OnnxAttrKindGraph        => "GRAPH"
+        OnnxAttrKindFloats       => "FLOATS"
+        OnnxAttrKindInts         => "INTS"
+        OnnxAttrKindStrings      => "STRINGS"
+        OnnxAttrKindTensors      => "TENSORS"
+        OnnxAttrKindGraphs       => "GRAPHS"
+        OnnxAttrKindSparseTensor => "SPARSE_TENSOR"
+        OnnxAttrKindTypeProto    => "TYPE_PROTO"
 
 // The kind a value's arm corresponds to.
 //
@@ -178,7 +218,18 @@ pub fn kind_name(k: OnnxAttrKind) -> Str []
 //     println(onnxattr.kind_name(onnxattr.kind_of(OnnxAttrInts([1, 2]))))   // INTS
 // ```
 pub fn kind_of(v: OnnxAttrValue) -> OnnxAttrKind []
-    todo("onnx-nv.onnxattr.kind_of")
+    match v
+        OnnxAttrFloat(_)     => OnnxAttrKindFloat
+        OnnxAttrInt(_)       => OnnxAttrKindInt
+        OnnxAttrString(_)    => OnnxAttrKindString
+        OnnxAttrTensor(_)    => OnnxAttrKindTensor
+        OnnxAttrGraph(_)     => OnnxAttrKindGraph
+        OnnxAttrFloats(_)    => OnnxAttrKindFloats
+        OnnxAttrInts(_)      => OnnxAttrKindInts
+        OnnxAttrStrings(_)   => OnnxAttrKindStrings
+        OnnxAttrTensors(_)   => OnnxAttrKindTensors
+        OnnxAttrGraphs(_)    => OnnxAttrKindGraphs
+        OnnxAttrRaw(kind, _) => kind
 
 // The kind the FILE declared for an attribute.
 //
@@ -190,7 +241,7 @@ pub fn kind_of(v: OnnxAttrValue) -> OnnxAttrKind []
 //     println(onnxattr.kind_name(onnxattr.declared_kind(a)))   // INT
 // ```
 pub fn declared_kind(a: OnnxAttribute) -> OnnxAttrKind []
-    todo("onnx-nv.onnxattr.declared_kind")
+    a.declared
 
 // Whether the declared kind and the value's arm agree.
 //
@@ -201,7 +252,7 @@ pub fn declared_kind(a: OnnxAttribute) -> OnnxAttrKind []
 //     println("${onnxattr.is_consistent(onnxattr.int_attr("axis", 1))}")   // true
 // ```
 pub fn is_consistent(a: OnnxAttribute) -> Bool []
-    todo("onnx-nv.onnxattr.is_consistent")
+    kind_code(kind_of(a.value)) == kind_code(a.declared)
 
 // An integer attribute.
 //
@@ -212,7 +263,8 @@ pub fn is_consistent(a: OnnxAttribute) -> Bool []
 //     println(onnxattr.int_attr("axis", 1).name)   // axis
 // ```
 pub fn int_attr(name: Str, value: Int) -> OnnxAttribute []
-    todo("onnx-nv.onnxattr.int_attr")
+    OnnxAttribute { name: name, declared: OnnxAttrKindInt,
+                    value: OnnxAttrInt(value), ref_name: "" }
 
 // A list-of-integers attribute: what `kernel_shape`, `pads`,
 // `strides` and `axes` all are.
@@ -226,7 +278,8 @@ pub fn int_attr(name: Str, value: Int) -> OnnxAttribute []
 //     println(onnxattr.kind_name(onnxattr.declared_kind(a)))   // INTS
 // ```
 pub fn ints_attr(name: Str, values: [Int]) -> OnnxAttribute []
-    todo("onnx-nv.onnxattr.ints_attr")
+    OnnxAttribute { name: name, declared: OnnxAttrKindInts,
+                    value: OnnxAttrInts(values), ref_name: "" }
 
 // A float attribute.
 //
@@ -237,7 +290,8 @@ pub fn ints_attr(name: Str, values: [Int]) -> OnnxAttribute []
 //     println(onnxattr.float_attr("epsilon", 1e-5).name)   // epsilon
 // ```
 pub fn float_attr(name: Str, value: Float) -> OnnxAttribute []
-    todo("onnx-nv.onnxattr.float_attr")
+    OnnxAttribute { name: name, declared: OnnxAttrKindFloat,
+                    value: OnnxAttrFloat(value), ref_name: "" }
 
 // A list-of-floats attribute.
 //
@@ -248,7 +302,8 @@ pub fn float_attr(name: Str, value: Float) -> OnnxAttribute []
 //     println(onnxattr.floats_attr("scales", [1.0, 2.0]).name)   // scales
 // ```
 pub fn floats_attr(name: Str, values: [Float]) -> OnnxAttribute []
-    todo("onnx-nv.onnxattr.floats_attr")
+    OnnxAttribute { name: name, declared: OnnxAttrKindFloats,
+                    value: OnnxAttrFloats(values), ref_name: "" }
 
 // A string attribute.
 //
@@ -259,7 +314,8 @@ pub fn floats_attr(name: Str, values: [Float]) -> OnnxAttribute []
 //     println(onnxattr.string_attr("auto_pad", "SAME_UPPER").name)
 // ```
 pub fn string_attr(name: Str, value: Str) -> OnnxAttribute []
-    todo("onnx-nv.onnxattr.string_attr")
+    OnnxAttribute { name: name, declared: OnnxAttrKindString,
+                    value: OnnxAttrString(value), ref_name: "" }
 
 // A tensor attribute: what `Constant`'s `value` is.
 //
@@ -273,7 +329,8 @@ pub fn string_attr(name: Str, value: Str) -> OnnxAttribute []
 //     println(onnxattr.tensor_attr("value", t).name)   // value
 // ```
 pub fn tensor_attr(name: Str, value: OnnxTensor) -> OnnxAttribute []
-    todo("onnx-nv.onnxattr.tensor_attr")
+    OnnxAttribute { name: name, declared: OnnxAttrKindTensor,
+                    value: OnnxAttrTensor(value), ref_name: "" }
 
 // An integer attribute's value, or `None` when it is not one.
 //
@@ -291,7 +348,9 @@ pub fn tensor_attr(name: Str, value: OnnxTensor) -> OnnxAttribute []
 //         None    => println("not an integer attribute")
 // ```
 pub fn as_int(a: OnnxAttribute) -> ?Int []
-    todo("onnx-nv.onnxattr.as_int")
+    match a.value
+        OnnxAttrInt(n) => Some(n)
+        _              => None
 
 // A list-of-integers attribute's value, or `None`.
 //
@@ -305,7 +364,9 @@ pub fn as_int(a: OnnxAttribute) -> ?Int []
 //         None     => println("not a list of integers")
 // ```
 pub fn as_ints(a: OnnxAttribute) -> ?[Int] []
-    todo("onnx-nv.onnxattr.as_ints")
+    match a.value
+        OnnxAttrInts(xs) => Some(xs[:])
+        _                => None
 
 // A float attribute's value, or `None`.
 //
@@ -318,7 +379,9 @@ pub fn as_ints(a: OnnxAttribute) -> ?[Int] []
 //         None    => println("not a float attribute")
 // ```
 pub fn as_float(a: OnnxAttribute) -> ?Float []
-    todo("onnx-nv.onnxattr.as_float")
+    match a.value
+        OnnxAttrFloat(f) => Some(f)
+        _                => None
 
 // A string attribute's value, or `None`.
 //
@@ -331,7 +394,9 @@ pub fn as_float(a: OnnxAttribute) -> ?Float []
 //         None    => println("not a string attribute")
 // ```
 pub fn as_string(a: OnnxAttribute) -> ?Str []
-    todo("onnx-nv.onnxattr.as_string")
+    match a.value
+        OnnxAttrString(s) => Some(s)
+        _                 => None
 
 // A tensor attribute's value, or `None`.
 //
@@ -347,7 +412,9 @@ pub fn as_string(a: OnnxAttribute) -> ?Str []
 //         None    => println("not a tensor attribute")
 // ```
 pub fn as_tensor(a: OnnxAttribute) -> ?OnnxTensor []
-    todo("onnx-nv.onnxattr.as_tensor")
+    match a.value
+        OnnxAttrTensor(t) => Some(t)
+        _                 => None
 
 // The subgraph indices an attribute refers to, in order.
 //
@@ -362,7 +429,10 @@ pub fn as_tensor(a: OnnxAttribute) -> ?OnnxTensor []
 //     println("${list.len(onnxattr.subgraph_indices(onnxattr.int_attr("axis", 1)))}")
 // ```
 pub fn subgraph_indices(a: OnnxAttribute) -> [Int] []
-    todo("onnx-nv.onnxattr.subgraph_indices")
+    match a.value
+        OnnxAttrGraph(index)    => [index]
+        OnnxAttrGraphs(indices) => indices[:]
+        _                       => []
 
 // The attribute with a given name from a list, or `None`.
 //
@@ -376,4 +446,7 @@ pub fn subgraph_indices(a: OnnxAttribute) -> [Int] []
 //         None    => println("absent")
 // ```
 pub fn named(attrs: [OnnxAttribute], name: Str) -> ?OnnxAttribute []
-    todo("onnx-nv.onnxattr.named")
+    for a in attrs
+        if a.name == name
+            return Some(a)
+    None

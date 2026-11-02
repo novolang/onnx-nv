@@ -8,12 +8,6 @@ a [Protocol Buffers](https://protobuf.dev/) message defined in
 This package reads an ONNX model into typed values, checks it against a
 carried operator-set table, and writes it back. It does not run one.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What an ONNX model is
 
 A **model** carries an `ir_version`, a list of **operator-set imports**,
@@ -90,10 +84,10 @@ fn main() [io]
             println("${onnxcheck.has_errors(findings)}")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: onnx-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`. The tests are the
+specification the implementation was written to: they assert
+`onnx.proto`'s own field numbers and the operator specification's own
+version history, and the reader is measured against them.
 
 ## What the package contains
 
@@ -169,9 +163,13 @@ main graph's node list, which misses everything inside `If`, `Loop` and
    default.** An attribute's default belongs to the operator and
    changes between opset versions.
 
-10. **Unknown fields survive a round trip.** Anything this package does
-    not model is kept and written back, so a model from a newer ONNX
-    comes out with its newer fields intact.
+10. **Unknown MODEL-level fields survive a round trip.** A field of
+    `ModelProto` this package does not model — a training graph, a
+    metadata entry, a newer field — is kept and written back, so a
+    model from a newer ONNX comes out with those intact. A field it
+    does not model inside a node, a graph, an opset import or an
+    attribute is stepped over when read and is not kept: the unknown
+    set is the model's own.
 
 11. **A check that finds nothing is not a proof.** The carried table
     holds arity, attribute names and since-versions. It does not hold
@@ -196,8 +194,10 @@ main graph's node list, which misses everything inside `If`, `Loop` and
   and written back unchanged.
 - **Quantisation rewriting.** Reading a quantised model is here;
   producing one is a transformation with its own calibration data.
-- **Sparse tensors.** `SparseTensorProto` is kept as bytes so a model
-  that uses one round trips, and is not modelled.
+- **Sparse tensors.** A `sparse_tensor` or `sparse_tensors` attribute
+  is kept as the bytes the file held, so a model that uses one round
+  trips; nothing here interprets one. A `sparse_initializer` is not a
+  field this package reads and is dropped by a write.
 - **Opening the external data file.** This package performs no input.
   The caller reads it and calls `attach_external`.
 
@@ -224,9 +224,11 @@ holds.
 
 The suite asserts the specifications directly.
 
-- **`onnx.proto`'s `TensorProto.DataType`** fixes the seventeen element
-  type codes and their names. Each is asserted, and the element widths
-  with them.
+- **`onnx.proto`'s `TensorProto.DataType`** names the element type
+  codes this package models — the first seventeen, `0` through
+  `BFLOAT16`. Each is asserted, the element widths with it, and every
+  code past the seventeenth is asserted to be refused as unknown
+  rather than guessed at, because the specification keeps adding them.
 - **`AttributeProto.AttributeType`** fixes the thirteen attribute
   kinds. An empty `INTS` and an empty `FLOATS` are asserted to be
   different, which is the case a reader that infers the type gets
@@ -238,24 +240,6 @@ The suite asserts the specifications directly.
   position and not an absence.
 - The symbolic-dimension rules are asserted on a shape that uses
   `batch` twice: one symbol, and binding it fills both.
-
-Today every one of those assertions reaches a `not implemented` panic.
-
-## Implementation status
-
-| Area | Status |
-| --- | --- |
-| Element types, shapes, tensors, value infos | declared, not implemented |
-| Attributes, with their declared kinds | declared, not implemented |
-| Model, graph, nodes, flat subgraph table | declared, not implemented |
-| The operator-set table | declared, not implemented |
-| Validation findings | declared, not implemented |
-| Reading and writing over protobuf-nv | declared, not implemented |
-| External data, both directions | declared, not implemented |
-| Shape inference | not declared |
-| Type constraints | not declared |
-| Function inlining | not declared |
-| Execution | not declared — libonnxruntime-sys's |
 
 ## Licence
 

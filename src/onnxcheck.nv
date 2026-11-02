@@ -23,7 +23,10 @@
 // accept an upload wants to refuse on the first kind and log the
 // second.
 
+use onnxattr
 use onnxgraph
+use onnxopset
+use onnxtype
 
 // How much a finding matters.
 //
@@ -72,7 +75,10 @@ pub struct OnnxFinding
 //     println(onnxcheck.severity_name(OnnxWarning))   // warning
 // ```
 pub fn severity_name(s: OnnxSeverity) -> Str []
-    todo("onnx-nv.onnxcheck.severity_name")
+    match s
+        OnnxError   => "error"
+        OnnxWarning => "warning"
+        OnnxNote    => "note"
 
 // Everything wrong with a model.
 //
@@ -95,7 +101,42 @@ pub fn severity_name(s: OnnxSeverity) -> Str []
 //     println("${list.len(onnxcheck.check(onnxgraph.empty_model())) >= 0}")
 // ```
 pub fn check(m: OnnxModel) -> [OnnxFinding] []
-    todo("onnx-nv.onnxcheck.check")
+    var out: [OnnxFinding] = []
+    if str.len(m.producer_name) == 0
+        list.push(out, finding(OnnxNote, "no_producer", 0 - 1, 0 - 1, "",
+            "the model names no producer"))
+    if m.ir_version > onnxopset.ONNX_MAX_IR_VERSION
+        list.push(out, finding(OnnxWarning, "ir_version_too_new", 0 - 1, 0 - 1, "",
+            "ir_version ${m.ir_version} is newer than the ${onnxopset.ONNX_MAX_IR_VERSION} this package understands"))
+    var has_nodes = false
+    for g in m.graphs
+        if list.len(g.node) > 0
+            has_nodes = true
+    if has_nodes
+        match onnxgraph.opset_version(m, "")
+            None    =>
+                list.push(out, finding(OnnxError, "no_opset_import", 0 - 1, 0 - 1, "",
+                    "the model has nodes and imports no version of the default operator set"))
+            Some(v) =>
+                if v > onnxopset.ONNX_MAX_OPSET
+                    list.push(out, finding(OnnxWarning, "opset_too_new", 0 - 1, 0 - 1, "",
+                        "the default operator set is imported at ${v}, above the ${onnxopset.ONNX_MAX_OPSET} the table carries"))
+    var gi = 0
+    for g in m.graphs
+        if not onnxgraph.is_sorted(g)
+            list.push(out, finding(OnnxWarning, "unsorted_nodes", gi, 0 - 1, "",
+                "the graph's nodes are not in topological order"))
+        for t in g.initializer
+            if not onnxtype.is_external(t)
+                if t.data_type != OnnxString and bytes.len(t.raw) != onnxtype.tensor_byte_length(t)
+                    list.push(out, finding(OnnxError, "tensor_size_mismatch", gi, 0 - 1, t.name,
+                        "initializer '${t.name}' holds ${bytes.len(t.raw)} byte(s) and its dimensions and element type imply ${onnxtype.tensor_byte_length(t)}"))
+        var ni = 0
+        for n in g.node
+            node_findings(m, gi, ni, g, n, var out)
+            ni = ni + 1
+        gi = gi + 1
+    out
 
 // Only the findings at or above a severity.
 //
@@ -109,7 +150,11 @@ pub fn check(m: OnnxModel) -> [OnnxFinding] []
 //     println("${list.len(onnxcheck.at_least(all, OnnxError)) <= list.len(all)}")
 // ```
 pub fn at_least(findings: [OnnxFinding], s: OnnxSeverity) -> [OnnxFinding] []
-    todo("onnx-nv.onnxcheck.at_least")
+    var out: [OnnxFinding] = []
+    for f in findings
+        if severity_rank(f.severity) >= severity_rank(s)
+            list.push(out, f)
+    out
 
 // Whether any finding is an error.
 //
@@ -124,7 +169,10 @@ pub fn at_least(findings: [OnnxFinding], s: OnnxSeverity) -> [OnnxFinding] []
 //     println("${onnxcheck.has_errors(onnxcheck.check(onnxgraph.empty_model()))}")
 // ```
 pub fn has_errors(findings: [OnnxFinding]) -> Bool []
-    todo("onnx-nv.onnxcheck.has_errors")
+    for f in findings
+        if f.severity == OnnxError
+            return true
+    false
 
 // The findings for one node only.
 //
@@ -141,7 +189,11 @@ pub fn has_errors(findings: [OnnxFinding]) -> Bool []
 //     println("${list.len(onnxcheck.for_node(all, 0, 0))}")   // 0
 // ```
 pub fn for_node(findings: [OnnxFinding], graph: Int, node: Int) -> [OnnxFinding] []
-    todo("onnx-nv.onnxcheck.for_node")
+    var out: [OnnxFinding] = []
+    for f in findings
+        if f.graph == graph and f.node == node
+            list.push(out, f)
+    out
 
 // Whether every operator in the model is one the carried table knows
 // at the version the model imported.
@@ -158,7 +210,7 @@ pub fn for_node(findings: [OnnxFinding], graph: Int, node: Int) -> [OnnxFinding]
 //     println("${onnxcheck.operators_are_known(onnxgraph.empty_model())}")   // true
 // ```
 pub fn operators_are_known(m: OnnxModel) -> Bool []
-    todo("onnx-nv.onnxcheck.operators_are_known")
+    list.len(unknown_operators(m)) == 0
 
 // Every operator the model uses that the table does not know at the
 // imported version, as a domain and an op type.
@@ -172,7 +224,25 @@ pub fn operators_are_known(m: OnnxModel) -> Bool []
 //     println("${list.len(onnxcheck.unknown_operators(onnxgraph.empty_model()))}")   // 0
 // ```
 pub fn unknown_operators(m: OnnxModel) -> [(Str, Str)] []
-    todo("onnx-nv.onnxcheck.unknown_operators")
+    var out: [(Str, Str)] = []
+    for g in m.graphs
+        for n in g.node
+            let op = (n.domain, n.op_type)
+            if list.contains(out, op)
+                continue
+            var known = false
+            match onnxgraph.opset_version(m, n.domain)
+                // A domain the model does not import has no version to
+                // check against, so its operators are unknown here.
+                None    => ()
+                Some(v) =>
+                    match onnxopset.schema_for(n.domain, n.op_type, v)
+                        Some(_) =>
+                            known = true
+                        None    => ()
+            if not known
+                list.push(out, op)
+    out
 
 // Every value a node consumes that nothing in its graph produces and
 // that is not a graph input or an initializer.
@@ -189,7 +259,16 @@ pub fn unknown_operators(m: OnnxModel) -> [(Str, Str)] []
 //     println("${list.len(onnxcheck.dangling_inputs(onnxgraph.empty_model()))}")   // 0
 // ```
 pub fn dangling_inputs(m: OnnxModel) -> [Str] []
-    todo("onnx-nv.onnxcheck.dangling_inputs")
+    var out: [Str] = []
+    var gi = 0
+    for g in m.graphs
+        for n in g.node
+            for name in n.input
+                if str.len(name) > 0
+                    if not list.contains(out, name) and not value_is_known(m, gi, g, name)
+                        list.push(out, name)
+        gi = gi + 1
+    out
 
 // Every value that is produced and never consumed and is not a graph
 // output.
@@ -206,7 +285,14 @@ pub fn dangling_inputs(m: OnnxModel) -> [Str] []
 //     println("${list.len(onnxcheck.unused_outputs(onnxgraph.empty_model()))}")   // 0
 // ```
 pub fn unused_outputs(m: OnnxModel) -> [Str] []
-    todo("onnx-nv.onnxcheck.unused_outputs")
+    var out: [Str] = []
+    for g in m.graphs
+        for n in g.node
+            for name in n.output
+                if str.len(name) > 0
+                    if not list.contains(out, name) and not produced_is_used(g, name)
+                        list.push(out, name)
+    out
 
 // The findings rendered one per line, each naming its severity, its
 // code and where it was.
@@ -223,4 +309,130 @@ pub fn unused_outputs(m: OnnxModel) -> [Str] []
 //     println("${list.len(onnxcheck.format(onnxcheck.check(onnxgraph.empty_model())))}")
 // ```
 pub fn format(findings: [OnnxFinding]) -> [Str] []
-    todo("onnx-nv.onnxcheck.format")
+    var out: [Str] = []
+    for f in findings
+        var where = "model"
+        if f.graph >= 0
+            if f.node >= 0
+                if str.len(f.node_name) > 0
+                    where = "graph ${f.graph} node ${f.node} ('${f.node_name}')"
+                else
+                    where = "graph ${f.graph} node ${f.node}"
+            else
+                where = "graph ${f.graph}"
+        list.push(out, "${severity_name(f.severity)}: ${f.code}: ${where}: ${f.message}")
+    out
+
+// ── the private half ─────────────────────────────────────────────────
+//
+// A finding is built in one place so that the severity, the code and
+// the sentence cannot drift apart between the sites that report it.
+
+fn finding(severity: OnnxSeverity, code: Str, graph: Int, node: Int, node_name: Str,
+           message: Str) -> OnnxFinding
+    OnnxFinding { severity: severity, code: code, graph: graph, node: node,
+                  node_name: node_name, message: message }
+
+// How a severity compares: an error outranks a warning, and a warning a
+// note.
+fn severity_rank(s: OnnxSeverity) -> Int
+    match s
+        OnnxError   => 2
+        OnnxWarning => 1
+        OnnxNote    => 0
+
+// "2 to 3", "1 or more", "1".
+fn arity_text(lo: Int, hi: Int) -> Str
+    if hi < 0
+        return "${lo} or more"
+    if lo == hi
+        return "${lo}"
+    "${lo} to ${hi}"
+
+// Every finding about one node, appended to `out`.
+fn node_findings(m: OnnxModel, gi: Int, ni: Int, g: OnnxGraph, n: OnnxNode, var out: [OnnxFinding])
+    if str.len(n.name) == 0
+        list.push(out, finding(OnnxNote, "unnamed_node", gi, ni, "",
+            "the node has no name"))
+    for name in n.input
+        // An empty name is an omitted optional input, which ONNX
+        // spells as an empty string in the operand's place.
+        if str.len(name) > 0
+            if not value_is_known(m, gi, g, name)
+                list.push(out, finding(OnnxError, "dangling_input", gi, ni, n.name,
+                    "the input '${name}' is not a graph input, an initializer, or the output of any node"))
+    for a in n.attribute
+        // An attribute that is a FUNCTION's parameter carries no value
+        // of its own, so its declared kind is not a mismatch.
+        if str.len(a.ref_name) == 0 and not onnxattr.is_consistent(a)
+            list.push(out, finding(OnnxError, "attribute_type_mismatch", gi, ni, n.name,
+                "attribute '${a.name}' is declared ${onnxattr.kind_name(a.declared)} and holds ${onnxattr.kind_name(onnxattr.kind_of(a.value))}"))
+    let version = onnxgraph.opset_version(m, n.domain) ?? 0 - 1
+    match onnxopset.schema_for(n.domain, n.op_type, version)
+        None    =>
+            list.push(out, finding(OnnxError, "op_not_in_opset", gi, ni, n.name,
+                "'${n.op_type}' in domain '${n.domain}' is not an operator the table knows at version ${version}"))
+        Some(s) =>
+            let supplied = onnxgraph.supplied_input_count(n)
+            if not onnxopset.accepts_inputs(s, supplied)
+                list.push(out, finding(OnnxError, "input_arity", gi, ni, n.name,
+                    "'${n.op_type}' at version ${s.since_version} takes ${arity_text(s.min_input, s.max_input)} input(s) and this node supplies ${supplied}"))
+            let given = list.len(n.output)
+            if not onnxopset.accepts_outputs(s, given)
+                list.push(out, finding(OnnxError, "output_arity", gi, ni, n.name,
+                    "'${n.op_type}' at version ${s.since_version} answers ${arity_text(s.min_output, s.max_output)} output(s) and this node has ${given}"))
+            for a in n.attribute
+                if str.len(a.ref_name) == 0 and not onnxopset.accepts_attribute(s, a.name)
+                    list.push(out, finding(OnnxWarning, "attribute_not_accepted", gi, ni, n.name,
+                        "'${n.op_type}' at version ${s.since_version} takes no attribute '${a.name}'"))
+            for name in s.required_attributes
+                match onnxgraph.attribute_of(n, name)
+                    Some(_) => ()
+                    None    =>
+                        list.push(out, finding(OnnxError, "missing_attribute", gi, ni, n.name,
+                            "'${n.op_type}' at version ${s.since_version} requires the attribute '${name}'"))
+            if s.deprecated
+                list.push(out, finding(OnnxWarning, "deprecated_operator", gi, ni, n.name,
+                    "'${n.op_type}' at version ${s.since_version} is deprecated"))
+
+// Whether a graph produces or supplies a name.
+fn in_scope(g: OnnxGraph, name: Str) -> Bool
+    for t in g.initializer
+        if t.name == name
+            return true
+    for v in g.input
+        if v.name == name
+            return true
+    for n in g.node
+        for out in n.output
+            if out == name
+                return true
+    false
+
+// Whether a value a node consumes is one the model produces or
+// declares.
+//
+// A SUBGRAPH MAY CAPTURE A NAME FROM THE GRAPH AROUND IT — that is how
+// `Loop` and `If` reach what they close over — and the flat table does
+// not record which graph encloses which.  So a subgraph is allowed the
+// main graph's names as well as its own, which is the approximation
+// that keeps a control-flow model from being reported as full of
+// dangling inputs.  The cost is that a name supplied by an OUTER
+// SUBGRAPH is reported, which is the rarer shape.
+fn value_is_known(m: OnnxModel, gi: Int, g: OnnxGraph, name: Str) -> Bool
+    if in_scope(g, name)
+        return true
+    if gi == m.main
+        return false
+    in_scope(onnxgraph.main_graph(m), name)
+
+// Whether a produced name is consumed by a node or is an output of its
+// own graph.
+fn produced_is_used(g: OnnxGraph, name: Str) -> Bool
+    for v in g.output
+        if v.name == name
+            return true
+    for n in g.node
+        if list.contains(n.input, name)
+            return true
+    false

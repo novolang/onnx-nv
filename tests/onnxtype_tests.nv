@@ -2,8 +2,9 @@
 // be names, against `onnx.proto`'s `TensorProto.DataType` and
 // `TensorShapeProto`.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: onnx-nv.onnxtype.<fn>`.
+// GREEN since 0.1.0.  These assertions were written against the
+// specification, and the implementation in `src/` was written to
+// satisfy them — not the other way round.
 
 use std.test
 use std.list

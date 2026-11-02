@@ -32,6 +32,10 @@
 // shift `max` into `min`'s place and change what the model computes.
 
 use onnxattr
+use onnxopset
+use pbunknown
+use onnxfault
+use onnxtype
 
 // One operator-set import: a domain and the version of it this model
 // uses.
@@ -131,7 +135,7 @@ pub struct OnnxModel
 //     println(onnxgraph.opset_import("ai.onnx.ml", 3).domain)
 // ```
 pub fn opset_import(domain: Str, version: Int) -> OnnxOpsetImport []
-    todo("onnx-nv.onnxgraph.opset_import")
+    OnnxOpsetImport { domain: domain, version: version }
 
 // The version of a domain this model imports, or `None`.
 //
@@ -148,7 +152,10 @@ pub fn opset_import(domain: Str, version: Int) -> OnnxOpsetImport []
 //         None    => println("the default domain is not imported")
 // ```
 pub fn opset_version(m: OnnxModel, domain: Str) -> ?Int []
-    todo("onnx-nv.onnxgraph.opset_version")
+    for i in m.opset_import
+        if i.domain == domain
+            return Some(i.version)
+    None
 
 // A model with one empty graph and nothing else.
 //
@@ -162,7 +169,15 @@ pub fn opset_version(m: OnnxModel, domain: Str) -> ?Int []
 //     println("${list.len(onnxgraph.empty_model().graphs)}")   // 1
 // ```
 pub fn empty_model() -> OnnxModel []
-    todo("onnx-nv.onnxgraph.empty_model")
+    // The IR version this package reads, because a model it builds is
+    // written for the reader that will read it back.
+    let ir = onnxopset.ONNX_MAX_IR_VERSION
+    OnnxModel { ir_version: ir, opset_import: [],
+                producer_name: "", producer_version: "", domain: "",
+                model_version: 0, doc: "", main: 0,
+                graphs: [OnnxGraph { name: "", node: [], input: [], output: [],
+                                     value_info: [], initializer: [], doc: "" }],
+                unknown: pbunknown.empty() }
 
 // The model's main graph.
 //
@@ -174,7 +189,7 @@ pub fn empty_model() -> OnnxModel []
 //     println("${list.len(onnxgraph.main_graph(onnxgraph.empty_model()).node)}")   // 0
 // ```
 pub fn main_graph(m: OnnxModel) -> OnnxGraph []
-    todo("onnx-nv.onnxgraph.main_graph")
+    list.get(m.graphs, m.main)
 
 // The graph an attribute's index refers to, or `None`.
 //
@@ -187,7 +202,12 @@ pub fn main_graph(m: OnnxModel) -> OnnxGraph []
 //         None    => println("no such subgraph")
 // ```
 pub fn subgraph_at(m: OnnxModel, index: Int) -> ?OnnxGraph []
-    todo("onnx-nv.onnxgraph.subgraph_at")
+    var i = 0
+    for g in m.graphs
+        if i == index
+            return Some(g)
+        i = i + 1
+    None
 
 // A node from its parts.
 //
@@ -199,7 +219,8 @@ pub fn subgraph_at(m: OnnxModel, index: Int) -> ?OnnxGraph []
 //     println(n.op_type)                        // Conv
 // ```
 pub fn node(name: Str, op_type: Str, input: [Str], output: [Str]) -> OnnxNode []
-    todo("onnx-nv.onnxgraph.node")
+    OnnxNode { name: name, op_type: op_type, domain: "", input: input,
+               output: output, attribute: [], doc: "" }
 
 // The same node with an attribute set, replacing any of the same name.
 //
@@ -214,7 +235,20 @@ pub fn node(name: Str, op_type: Str, input: [Str], output: [Str]) -> OnnxNode []
 //     println("${list.len(k.attribute)}")       // 1
 // ```
 pub fn with_attribute(n: OnnxNode, a: OnnxAttribute) -> OnnxNode []
-    todo("onnx-nv.onnxgraph.with_attribute")
+    // A replacement keeps the place the attribute it replaced had, so
+    // the list stays the order the file wrote.
+    var out: [OnnxAttribute] = []
+    var replaced = false
+    for old in n.attribute
+        if old.name == a.name
+            list.push(out, a)
+            replaced = true
+        else
+            list.push(out, old)
+    if not replaced
+        list.push(out, a)
+    OnnxNode { name: n.name, op_type: n.op_type, domain: n.domain,
+               input: n.input, output: n.output, attribute: out, doc: n.doc }
 
 // A node's attribute by name, or `None`.
 //
@@ -228,7 +262,7 @@ pub fn with_attribute(n: OnnxNode, a: OnnxAttribute) -> OnnxNode []
 //         None    => println("absent")
 // ```
 pub fn attribute_of(n: OnnxNode, name: Str) -> ?OnnxAttribute []
-    todo("onnx-nv.onnxgraph.attribute_of")
+    onnxattr.named(n.attribute, name)
 
 // How many of a node's inputs are actually supplied.
 //
@@ -246,7 +280,11 @@ pub fn attribute_of(n: OnnxNode, name: Str) -> ?OnnxAttribute []
 //     println("${onnxgraph.supplied_input_count(n)}")   // 2
 // ```
 pub fn supplied_input_count(n: OnnxNode) -> Int []
-    todo("onnx-nv.onnxgraph.supplied_input_count")
+    var count = 0
+    for x in n.input
+        if str.len(x) > 0
+            count = count + 1
+    count
 
 // Whether the input at a position is supplied.
 //
@@ -258,7 +296,12 @@ pub fn supplied_input_count(n: OnnxNode) -> Int []
 //     println("${onnxgraph.has_input_at(n, 1)}")   // false
 // ```
 pub fn has_input_at(n: OnnxNode, index: Int) -> Bool []
-    todo("onnx-nv.onnxgraph.has_input_at")
+    var i = 0
+    for x in n.input
+        if i == index
+            return str.len(x) > 0
+        i = i + 1
+    false
 
 // Every node of every graph in the model, with the index of the graph
 // it came from.
@@ -275,7 +318,13 @@ pub fn has_input_at(n: OnnxNode, index: Int) -> Bool []
 //     println("${list.len(onnxgraph.all_nodes(onnxgraph.empty_model()))}")   // 0
 // ```
 pub fn all_nodes(m: OnnxModel) -> [(Int, OnnxNode)] []
-    todo("onnx-nv.onnxgraph.all_nodes")
+    var out: [(Int, OnnxNode)] = []
+    var gi = 0
+    for g in m.graphs
+        for n in g.node
+            list.push(out, (gi, n))
+        gi = gi + 1
+    out
 
 // The subgraph indices a node's attributes refer to.
 //
@@ -288,7 +337,11 @@ pub fn all_nodes(m: OnnxModel) -> [(Int, OnnxNode)] []
 //     println("${list.len(onnxgraph.walk_subgraphs(n))}")   // 0
 // ```
 pub fn walk_subgraphs(n: OnnxNode) -> [Int] []
-    todo("onnx-nv.onnxgraph.walk_subgraphs")
+    var out: [Int] = []
+    for a in n.attribute
+        for index in onnxattr.subgraph_indices(a)
+            list.push(out, index)
+    out
 
 // The graph's inputs that are NOT also initializers.
 //
@@ -305,7 +358,15 @@ pub fn walk_subgraphs(n: OnnxNode) -> [Int] []
 //     println("${list.len(onnxgraph.true_inputs(onnxgraph.main_graph(onnxgraph.empty_model())))}")
 // ```
 pub fn true_inputs(g: OnnxGraph) -> [OnnxValueInfo] []
-    todo("onnx-nv.onnxgraph.true_inputs")
+    var out: [OnnxValueInfo] = []
+    for v in g.input
+        var is_weight = false
+        for t in g.initializer
+            if t.name == v.name
+                is_weight = true
+        if not is_weight
+            list.push(out, v)
+    out
 
 // The node that produces a named value, or `None`.
 //
@@ -321,7 +382,15 @@ pub fn true_inputs(g: OnnxGraph) -> [OnnxValueInfo] []
 //         None    => println("a graph input, an initializer, or absent")
 // ```
 pub fn producer_of(g: OnnxGraph, name: Str) -> ?OnnxNode []
-    todo("onnx-nv.onnxgraph.producer_of")
+    // An empty name is the "optional input not supplied" marker in an
+    // input list and never a value's name, so nothing produces it.
+    if str.len(name) == 0
+        return None
+    for n in g.node
+        for out in n.output
+            if out == name
+                return Some(n)
+    None
 
 // The node indices that consume a named value.
 //
@@ -334,7 +403,17 @@ pub fn producer_of(g: OnnxGraph, name: Str) -> ?OnnxNode []
 //     println("${list.len(onnxgraph.consumers_of(g, "x"))}")   // 0
 // ```
 pub fn consumers_of(g: OnnxGraph, name: Str) -> [Int] []
-    todo("onnx-nv.onnxgraph.consumers_of")
+    var out: [Int] = []
+    // As in `producer_of`: the empty name is a position, not a value,
+    // so no node is its consumer.
+    if str.len(name) == 0
+        return out
+    var i = 0
+    for n in g.node
+        if list.contains(n.input, name)
+            list.push(out, i)
+        i = i + 1
+    out
 
 // An initializer by name, or `None`.
 //
@@ -347,7 +426,10 @@ pub fn consumers_of(g: OnnxGraph, name: Str) -> [Int] []
 //         None    => println("absent")
 // ```
 pub fn initializer_of(g: OnnxGraph, name: Str) -> ?OnnxTensor []
-    todo("onnx-nv.onnxgraph.initializer_of")
+    for t in g.initializer
+        if t.name == name
+            return Some(t)
+    None
 
 // The value info for a name, looking in the inputs, the outputs and
 // `value_info`, or `None`.
@@ -361,7 +443,59 @@ pub fn initializer_of(g: OnnxGraph, name: Str) -> ?OnnxTensor []
 //         None    => println("undeclared, which is ordinary for an intermediate")
 // ```
 pub fn type_of(g: OnnxGraph, name: Str) -> ?OnnxValueInfo []
-    todo("onnx-nv.onnxgraph.type_of")
+    for v in g.input
+        if v.name == name
+            return Some(v)
+    for v in g.output
+        if v.name == name
+            return Some(v)
+    for v in g.value_info
+        if v.name == name
+            return Some(v)
+    None
+
+// Whether every node's inputs are produced before it, which is what
+// "the file stored the nodes in topological order" means.
+//
+// THE MAP IS BUILT OVER THE WHOLE NODE LIST BEFORE ANY NODE IS
+// CHECKED, because an input whose producer comes LATER is exactly the
+// defect being looked for: a walk that only remembered what it had
+// already passed would call such a graph sorted, and every consumer of
+// this answer — the checker's note, the ordering's fast path — would
+// then be wrong in the direction that matters.
+//
+// The empty name is skipped: it is the omitted-optional marker, and
+// nothing produces it.
+fn nodes_in_order(g: OnnxGraph) -> Bool
+    // First producer wins, the same rule `producer_of` uses.
+    var producer: HashMap<Str, Int> = HashMap.new()
+    var i = 0
+    for n in g.node
+        for out in n.output
+            if not producer.has(out)
+                producer.set(out, i)
+        i = i + 1
+    i = 0
+    for n in g.node
+        for name in n.input
+            if str.len(name) > 0
+                match producer.get(name)
+                    Some(p) =>
+                        if p >= i
+                            return false
+                    None    => ()
+        i = i + 1
+    true
+
+// The name of the node at an index, or `""` past the end.
+fn node_name_at(g: OnnxGraph, index: Int) -> Str
+    var i = 0
+    for n in g.node
+        if i == index
+            return n.name
+        i = i + 1
+    // cov: skip — `cycle_at` is an index below the node count, so the walk above returns before it and the fallback is unreachable
+    ""
 
 // The node indices in an order where every node comes after the nodes
 // producing its inputs, or `OnnxGraphHasCycle`.
@@ -381,7 +515,63 @@ pub fn type_of(g: OnnxGraph, name: Str) -> ?OnnxValueInfo []
 //         Err(e)    => println(e.message())
 // ```
 pub fn topological_order(g: OnnxGraph) -> Result<[Int], OnnxFault> []
-    todo("onnx-nv.onnxgraph.topological_order")
+    let count = list.len(g.node)
+    var order: [Int] = []
+    var i = 0
+    // The file's own order, unchanged, for the ordinary case.
+    if nodes_in_order(g)
+        while i < count
+            list.push(order, i)
+            i = i + 1
+        return Ok(order)
+    // First producer wins, the same rule `producer_of` uses.
+    var producer: HashMap<Str, Int> = HashMap.new()
+    var k = 0
+    for n in g.node
+        for out in n.output
+            if not producer.has(out)
+                producer.set(out, k)
+        k = k + 1
+    // Kahn's algorithm: a node becomes ready when its last producer
+    // has been placed, and the file's order breaks the ties.
+    var indegree = list.zeros(count)
+    var successors: [[Int]] = []
+    var s = 0
+    while s < count
+        list.push(successors, [])
+        s = s + 1
+    var a = 0
+    for n in g.node
+        for name in n.input
+            if str.len(name) > 0
+                match producer.get(name)
+                    Some(p) =>
+                        indegree[a] = indegree[a] + 1
+                        list.push(successors[p], a)
+                    None    => ()
+        a = a + 1
+    var ready: [Int] = []
+    for q in 0..count
+        if indegree[q] == 0
+            list.push(ready, q)
+    var head = 0
+    while head < list.len(ready)
+        let v = list.get(ready, head)
+        head = head + 1
+        list.push(order, v)
+        for w in successors[v]
+            indegree[w] = indegree[w] - 1
+            if indegree[w] == 0
+                list.push(ready, w)
+    // Whatever still holds an in-degree is in a cycle, or behind one.
+    // The first of them is the node the refusal names.
+    var cycle_at: ?Int = None
+    for r in 0..count
+        if indegree[r] > 0 and cycle_at == None
+            cycle_at = Some(r)
+    match cycle_at
+        Some(at) => Err(OnnxGraphHasCycle(at, node_name_at(g, at)))
+        None     => Ok(order)
 
 // Whether the graph's nodes are already in topological order.
 //
@@ -392,7 +582,7 @@ pub fn topological_order(g: OnnxGraph) -> Result<[Int], OnnxFault> []
 //     println("${onnxgraph.is_sorted(onnxgraph.main_graph(onnxgraph.empty_model()))}")
 // ```
 pub fn is_sorted(g: OnnxGraph) -> Bool []
-    todo("onnx-nv.onnxgraph.is_sorted")
+    nodes_in_order(g)
 
 // How many bytes the model's initializers hold in total.
 //
@@ -406,7 +596,15 @@ pub fn is_sorted(g: OnnxGraph) -> Bool []
 //     println("${onnxgraph.weight_bytes(onnxgraph.empty_model())}")   // 0
 // ```
 pub fn weight_bytes(m: OnnxModel) -> Int []
-    todo("onnx-nv.onnxgraph.weight_bytes")
+    var total = 0
+    for g in m.graphs
+        for t in g.initializer
+            total = total + bytes.len(t.raw)
+            // A string tensor's elements are the bytes, and they are
+            // not in `raw`.
+            for s in t.strings
+                total = total + str.len(s)
+    total
 
 // Every distinct operator the model uses, as a domain and an op type.
 //
@@ -422,4 +620,10 @@ pub fn weight_bytes(m: OnnxModel) -> Int []
 //     println("${list.len(onnxgraph.operators_used(onnxgraph.empty_model()))}")   // 0
 // ```
 pub fn operators_used(m: OnnxModel) -> [(Str, Str)] []
-    todo("onnx-nv.onnxgraph.operators_used")
+    var out: [(Str, Str)] = []
+    for g in m.graphs
+        for n in g.node
+            let op = (n.domain, n.op_type)
+            if not list.contains(out, op)
+                list.push(out, op)
+    out

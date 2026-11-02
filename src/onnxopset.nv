@@ -79,6 +79,91 @@ pub const ONNX_MAX_OPSET = 21
 // The version of `ir_version` this package understands.
 pub const ONNX_MAX_IR_VERSION = 10
 
+// The table is scanned, not indexed.
+//
+// A row's key is a prefix of the row — `"|Conv|"`, `"ai.onnx.ml|SVMRegressor|"`
+// — so a row that is not the operator being asked for differs within
+// the first few bytes and costs one `starts_with`.  The alternative, a
+// `HashMap<Str, [OnnxOpSchema]>` built on first use, trades that scan
+// for materialising five hundred and nineteen structs, each with two
+// string lists, to answer a question that usually needs one.  The scan
+// is the cheaper of the two and the one with no state.
+//
+// The `|` in the key is what keeps `TreeEnsemble` from matching
+// `TreeEnsembleClassifier`: the delimiter is part of the prefix.
+
+// One row split into its ten fields.
+//
+// The split is only done for a row the prefix already matched, so a
+// lookup pays for one split, not for five hundred.
+fn fields_of(line: Str) -> [Str]
+    str.split(line, "|")
+
+// The integer in a field, or `0` for an empty one.
+//
+// The table leaves a field empty rather than writing the zero the
+// schema did not mean: `max_input` empty would be "no input allowed",
+// and the table writes `-1` for variadic.
+fn int_field(fields: [Str], index: Int) -> Int
+    match str.to_int(list.get(fields, index))
+        Some(n) => n
+        // cov: skip — every row of the generated table carries all ten fields, so `str.to_int` never meets a field that is not a number; the table's shape is pinned by tests/onnxopset_tests.nv
+        None    => 0
+
+// A comma-separated name field as a list, empty for an empty field.
+fn names_field(fields: [Str], index: Int) -> [Str]
+    let text = list.get(fields, index)
+    if str.len(text) == 0
+        return []
+    str.split(text, ",")
+
+// The `since_version` of a row, which is the field the table is
+// ordered by.
+fn since_of(line: Str) -> Int
+    int_field(fields_of(line), 2)
+
+// The domain of a row, which is the field before the first `|`.
+fn domain_of(line: Str) -> Str
+    match str.index(line, "|")
+        Some(at) => str.slice(line, 0, at)
+        // cov: skip — every row of the generated table holds a '|', so the domain lookup always finds one; the table's shape is pinned by tests/onnxopset_tests.nv
+        None     => ""
+
+// A row as a schema.
+fn schema_of_line(line: Str) -> OnnxOpSchema
+    let f = fields_of(line)
+    OnnxOpSchema {
+        domain: list.get(f, 0),
+        op_type: list.get(f, 1),
+        since_version: int_field(f, 2),
+        min_input: int_field(f, 3),
+        max_input: int_field(f, 4),
+        min_output: int_field(f, 5),
+        max_output: int_field(f, 6),
+        deprecated: str.len(list.get(f, 7)) > 0,
+        required_attributes: names_field(f, 8),
+        attributes: names_field(f, 9) }
+
+// A schema inserted into a list kept in `since_version` order.
+//
+// The table is emitted in that order already, so this walks the list
+// without moving anything for every row the generator produced; it is
+// here so that the answer does not depend on the generator having done
+// so.
+fn insert_by_since(xs: [OnnxOpSchema], s: OnnxOpSchema) -> [OnnxOpSchema]
+    var out: [OnnxOpSchema] = []
+    var placed = false
+    for x in xs
+        if not placed and s.since_version < x.since_version
+            // cov: skip — the table is generated in ascending `since_version` order within each domain and op, so this walk never inserts; the branch is here so that the answer does not depend on the generator having sorted it
+            list.push(out, s)
+            // cov: skip — the other half of the insertion above: `placed` is only set where a row is out of order, which the generated table never is
+            placed = true
+        list.push(out, x)
+    if not placed
+        list.push(out, s)
+    out
+
 // The schema in force for an operator at a version, or `None`.
 //
 // The one with the largest `since_version` no greater than `version`.
@@ -95,7 +180,18 @@ pub const ONNX_MAX_IR_VERSION = 10
 //         None    => println("not in the table")
 // ```
 pub fn schema_for(domain: Str, op_type: Str, version: Int) -> ?OnnxOpSchema []
-    todo("onnx-nv.onnxopset.schema_for")
+    let prefix = domain + "|" + op_type + "|"
+    var best = ""
+    var best_since = -1
+    for line in ROWS
+        if str.starts_with(line, prefix)
+            let since = since_of(line)
+            if since <= version and since > best_since
+                best_since = since
+                best = line
+    if best_since < 0
+        return None
+    Some(schema_of_line(best))
 
 // Every version of an operator the table carries, oldest first.
 //
@@ -109,7 +205,12 @@ pub fn schema_for(domain: Str, op_type: Str, version: Int) -> ?OnnxOpSchema []
 //     println("${list.len(onnxopset.versions_of("", "Squeeze")) >= 2}")   // true
 // ```
 pub fn versions_of(domain: Str, op_type: Str) -> [OnnxOpSchema] []
-    todo("onnx-nv.onnxopset.versions_of")
+    let prefix = domain + "|" + op_type + "|"
+    var out: [OnnxOpSchema] = []
+    for line in ROWS
+        if str.starts_with(line, prefix)
+            out = insert_by_since(out, schema_of_line(line))
+    out
 
 // The version at which an operator first appeared, or `None`.
 //
@@ -122,7 +223,16 @@ pub fn versions_of(domain: Str, op_type: Str) -> [OnnxOpSchema] []
 //         None    => println("not in the table")
 // ```
 pub fn introduced_at(domain: Str, op_type: Str) -> ?Int []
-    todo("onnx-nv.onnxopset.introduced_at")
+    let prefix = domain + "|" + op_type + "|"
+    var best = -1
+    for line in ROWS
+        if str.starts_with(line, prefix)
+            let since = since_of(line)
+            if best < 0 or since < best
+                best = since
+    if best < 0
+        return None
+    Some(best)
 
 // Whether the table knows an operator in a domain at all.
 //
@@ -134,7 +244,9 @@ pub fn introduced_at(domain: Str, op_type: Str) -> ?Int []
 //     println("${onnxopset.is_known("", "NotAnOperator")}")   // false
 // ```
 pub fn is_known(domain: Str, op_type: Str) -> Bool []
-    todo("onnx-nv.onnxopset.is_known")
+    match introduced_at(domain, op_type)
+        Some(_) => true
+        None    => false
 
 // Whether a supplied-input count fits a schema's arity.
 //
@@ -150,7 +262,11 @@ pub fn is_known(domain: Str, op_type: Str) -> Bool []
 //         None    => println("not in the table")
 // ```
 pub fn accepts_inputs(s: OnnxOpSchema, count: Int) -> Bool []
-    todo("onnx-nv.onnxopset.accepts_inputs")
+    if count < s.min_input
+        return false
+    if s.max_input < 0
+        return true
+    count <= s.max_input
 
 // Whether an output count fits a schema's arity.
 //
@@ -163,7 +279,11 @@ pub fn accepts_inputs(s: OnnxOpSchema, count: Int) -> Bool []
 //         None    => println("not in the table")
 // ```
 pub fn accepts_outputs(s: OnnxOpSchema, count: Int) -> Bool []
-    todo("onnx-nv.onnxopset.accepts_outputs")
+    if count < s.min_output
+        return false
+    if s.max_output < 0
+        return true
+    count <= s.max_output
 
 // Whether the operator's last input is variadic.
 //
@@ -176,7 +296,7 @@ pub fn accepts_outputs(s: OnnxOpSchema, count: Int) -> Bool []
 //         None    => println("not in the table")
 // ```
 pub fn is_variadic_input(s: OnnxOpSchema) -> Bool []
-    todo("onnx-nv.onnxopset.is_variadic_input")
+    s.max_input < 0
 
 // Whether an attribute name is one the operator accepts.
 //
@@ -189,7 +309,7 @@ pub fn is_variadic_input(s: OnnxOpSchema) -> Bool []
 //         None    => println("not in the table")
 // ```
 pub fn accepts_attribute(s: OnnxOpSchema, name: Str) -> Bool []
-    todo("onnx-nv.onnxopset.accepts_attribute")
+    list.contains(s.attributes, name)
 
 // Whether an attribute name is one the operator requires.
 //
@@ -202,7 +322,7 @@ pub fn accepts_attribute(s: OnnxOpSchema, name: Str) -> Bool []
 //         None    => println("not in the table")
 // ```
 pub fn requires_attribute(s: OnnxOpSchema, name: Str) -> Bool []
-    todo("onnx-nv.onnxopset.requires_attribute")
+    list.contains(s.required_attributes, name)
 
 // Every operator the table carries for a domain, in name order.
 //
@@ -214,7 +334,14 @@ pub fn requires_attribute(s: OnnxOpSchema, name: Str) -> Bool []
 //     println("${list.len(onnxopset.operators_in("")) > 100}")   // true
 // ```
 pub fn operators_in(domain: Str) -> [Str] []
-    todo("onnx-nv.onnxopset.operators_in")
+    let prefix = domain + "|"
+    var out: [Str] = []
+    for line in ROWS
+        if str.starts_with(line, prefix)
+            let op_type = list.get(fields_of(line), 1)
+            if not list.contains(out, op_type)
+                list.push(out, op_type)
+    out
 
 // Every domain the table carries.
 //
@@ -226,7 +353,12 @@ pub fn operators_in(domain: Str) -> [Str] []
 //     println("${list.len(onnxopset.domains()) >= 2}")   // true
 // ```
 pub fn domains() -> [Str] []
-    todo("onnx-nv.onnxopset.domains")
+    var out: [Str] = []
+    for line in ROWS
+        let domain = domain_of(line)
+        if not list.contains(out, domain)
+            list.push(out, domain)
+    out
 
 // The version at which an operator's spelling last changed at or
 // before a version, or `None`.
@@ -244,4 +376,555 @@ pub fn domains() -> [Str] []
 //         None    => println("not in the table")
 // ```
 pub fn last_change_before(domain: Str, op_type: Str, version: Int) -> ?Int []
-    todo("onnx-nv.onnxopset.last_change_before")
+    match schema_for(domain, op_type, version)
+        Some(s) => Some(s.since_version)
+        None    => None
+// THE TABLE
+//
+// One row per (domain, operator, `since_version`), emitted from the
+// ONNX documentation's per-version changelogs: the default domain up to
+// opset 21 and `ai.onnx.ml` up to opset 5, which are the two operator
+// sets the changelog describes version history for and the two a model
+// reaches for without a vendor's runtime.
+//
+// Ten `|`-separated fields:
+//
+//     domain | op type | since | min in | max in | min out | max out |
+//     deprecated | required attributes | accepted attributes
+//
+// `max` is `-1` when the last input — or output — is variadic:
+// `Concat` takes any number above its minimum, `Split` gives any
+// number.  The two name fields are comma-separated, and the accepted
+// list is the attributes the specification documents, which is what a
+// node may carry.  An empty field is `""`, never a zero standing in for
+// something the row does not mean.
+//
+// Rows are ordered by (domain, operator, since), which makes a scan of
+// the table a walk in version order for one operator and in name order
+// for one domain.  `insert_by_since` does not rely on that, but
+// `operators_in` does.
+//
+// A row is a snapshot of the specification at one version, and this
+// package does not update itself: a model importing an opset above the
+// table's ceiling still reads, and `onnxcheck` is what says the table
+// cannot speak for it.
+const ROWS: [Str] = [
+    "|Abs|1|1|1|1|1|||consumed_inputs",
+    "|Abs|6|1|1|1|1|||",
+    "|Abs|13|1|1|1|1|||",
+    "|Acos|7|1|1|1|1|||",
+    "|Acosh|9|1|1|1|1|||",
+    "|Add|1|2|2|1|1|||axis,broadcast,consumed_inputs",
+    "|Add|6|2|2|1|1|||axis,broadcast",
+    "|Add|7|2|2|1|1|||",
+    "|Add|13|2|2|1|1|||",
+    "|Add|14|2|2|1|1|||",
+    "|AffineGrid|20|2|2|1|1|||align_corners",
+    "|And|1|2|2|1|1|||axis,broadcast",
+    "|And|7|2|2|1|1|||",
+    "|ArgMax|1|1|1|1|1|||axis,keepdims",
+    "|ArgMax|11|1|1|1|1|||axis,keepdims",
+    "|ArgMax|12|1|1|1|1|||axis,keepdims,select_last_index",
+    "|ArgMax|13|1|1|1|1|||axis,keepdims,select_last_index",
+    "|ArgMin|1|1|1|1|1|||axis,keepdims",
+    "|ArgMin|11|1|1|1|1|||axis,keepdims",
+    "|ArgMin|12|1|1|1|1|||axis,keepdims,select_last_index",
+    "|ArgMin|13|1|1|1|1|||axis,keepdims,select_last_index",
+    "|Asin|7|1|1|1|1|||",
+    "|Asinh|9|1|1|1|1|||",
+    "|Atan|7|1|1|1|1|||",
+    "|Atanh|9|1|1|1|1|||",
+    "|AveragePool|1|1|1|1|1||kernel_shape|auto_pad,kernel_shape,pads,strides",
+    "|AveragePool|7|1|1|1|1||kernel_shape|auto_pad,count_include_pad,kernel_shape,pads,strides",
+    "|AveragePool|10|1|1|1|1||kernel_shape|auto_pad,ceil_mode,count_include_pad,kernel_shape,pads,strides",
+    "|AveragePool|11|1|1|1|1||kernel_shape|auto_pad,ceil_mode,count_include_pad,kernel_shape,pads,strides",
+    "|AveragePool|19|1|1|1|1||kernel_shape|auto_pad,ceil_mode,count_include_pad,dilations,kernel_shape,pads,strides",
+    "|BatchNormalization|1|5|5|1|5||consumed_inputs|consumed_inputs,epsilon,is_test,momentum,spatial",
+    "|BatchNormalization|6|5|5|1|5|||epsilon,is_test,momentum,spatial",
+    "|BatchNormalization|7|5|5|1|5|||epsilon,momentum,spatial",
+    "|BatchNormalization|9|5|5|1|5|||epsilon,momentum",
+    "|BatchNormalization|14|5|5|1|3|||epsilon,momentum,training_mode",
+    "|BatchNormalization|15|5|5|1|3|||epsilon,momentum,training_mode",
+    "|Bernoulli|15|1|1|1|1|||dtype,seed",
+    "|BitShift|11|2|2|1|1||direction|direction",
+    "|BitwiseAnd|18|2|2|1|1|||",
+    "|BitwiseNot|18|1|1|1|1|||",
+    "|BitwiseOr|18|2|2|1|1|||",
+    "|BitwiseXor|18|2|2|1|1|||",
+    "|BlackmanWindow|17|1|1|1|1|||output_datatype,periodic",
+    "|Cast|1|1|1|1|1||to|to",
+    "|Cast|6|1|1|1|1||to|to",
+    "|Cast|9|1|1|1|1||to|to",
+    "|Cast|13|1|1|1|1||to|to",
+    "|Cast|19|1|1|1|1||to|saturate,to",
+    "|Cast|21|1|1|1|1||to|saturate,to",
+    "|CastLike|15|2|2|1|1|||",
+    "|CastLike|19|2|2|1|1|||saturate",
+    "|CastLike|21|2|2|1|1|||saturate",
+    "|Ceil|1|1|1|1|1|||consumed_inputs",
+    "|Ceil|6|1|1|1|1|||",
+    "|Ceil|13|1|1|1|1|||",
+    "|Celu|12|1|1|1|1|||alpha",
+    "|CenterCropPad|18|2|2|1|1|||axes",
+    "|Clip|1|1|1|1|1|||consumed_inputs,max,min",
+    "|Clip|6|1|1|1|1|||max,min",
+    "|Clip|11|1|3|1|1|||",
+    "|Clip|12|1|3|1|1|||",
+    "|Clip|13|1|3|1|1|||",
+    "|Col2Im|18|3|3|1|1|||dilations,pads,strides",
+    "|Compress|9|2|2|1|1|||axis",
+    "|Compress|11|2|2|1|1|||axis",
+    "|Concat|1|1|-1|1|1|||axis",
+    "|Concat|4|1|-1|1|1||axis|axis",
+    "|Concat|11|1|-1|1|1||axis|axis",
+    "|Concat|13|1|-1|1|1||axis|axis",
+    "|ConcatFromSequence|11|1|1|1|1||axis|axis,new_axis",
+    "|Constant|1|0|0|1|1||value|value",
+    "|Constant|9|0|0|1|1||value|value",
+    "|Constant|11|0|0|1|1|||sparse_value,value",
+    "|Constant|12|0|0|1|1|||sparse_value,value,value_float,value_floats,value_int,value_ints,value_string,value_strings",
+    "|Constant|13|0|0|1|1|||sparse_value,value,value_float,value_floats,value_int,value_ints,value_string,value_strings",
+    "|Constant|19|0|0|1|1|||sparse_value,value,value_float,value_floats,value_int,value_ints,value_string,value_strings",
+    "|Constant|21|0|0|1|1|||sparse_value,value,value_float,value_floats,value_int,value_ints,value_string,value_strings",
+    "|ConstantOfShape|9|1|1|1|1|||value",
+    "|ConstantOfShape|20|1|1|1|1|||value",
+    "|ConstantOfShape|21|1|1|1|1|||value",
+    "|Conv|1|2|3|1|1|||auto_pad,dilations,group,kernel_shape,pads,strides",
+    "|Conv|11|2|3|1|1|||auto_pad,dilations,group,kernel_shape,pads,strides",
+    "|ConvInteger|10|2|4|1|1|||auto_pad,dilations,group,kernel_shape,pads,strides",
+    "|ConvTranspose|1|2|3|1|1|||auto_pad,dilations,group,kernel_shape,output_padding,output_shape,pads,strides",
+    "|ConvTranspose|11|2|3|1|1|||auto_pad,dilations,group,kernel_shape,output_padding,output_shape,pads,strides",
+    "|Cos|7|1|1|1|1|||",
+    "|Cosh|9|1|1|1|1|||",
+    "|CumSum|11|2|2|1|1|||exclusive,reverse",
+    "|CumSum|14|2|2|1|1|||exclusive,reverse",
+    "|DFT|17|1|2|1|1|||axis,inverse,onesided",
+    "|DFT|20|1|3|1|1|||inverse,onesided",
+    "|DeformConv|19|3|5|1|1|||dilations,group,kernel_shape,offset_group,pads,strides",
+    "|DepthToSpace|1|1|1|1|1||blocksize|blocksize",
+    "|DepthToSpace|11|1|1|1|1||blocksize|blocksize,mode",
+    "|DepthToSpace|13|1|1|1|1||blocksize|blocksize,mode",
+    "|DequantizeLinear|10|2|3|1|1|||",
+    "|DequantizeLinear|13|2|3|1|1|||axis",
+    "|DequantizeLinear|19|2|3|1|1|||axis",
+    "|DequantizeLinear|21|2|3|1|1|||axis,block_size",
+    "|Det|11|1|1|1|1|||",
+    "|Div|1|2|2|1|1|||axis,broadcast,consumed_inputs",
+    "|Div|6|2|2|1|1|||axis,broadcast",
+    "|Div|7|2|2|1|1|||",
+    "|Div|13|2|2|1|1|||",
+    "|Div|14|2|2|1|1|||",
+    "|Dropout|1|1|1|1|2|||consumed_inputs,is_test,ratio",
+    "|Dropout|6|1|1|1|2|||is_test,ratio",
+    "|Dropout|7|1|1|1|2|||ratio",
+    "|Dropout|10|1|1|1|2|||ratio",
+    "|Dropout|12|1|3|1|2|||seed",
+    "|Dropout|13|1|3|1|2|||seed",
+    "|DynamicQuantizeLinear|11|1|1|3|3|||",
+    "|Einsum|12|1|-1|1|1||equation|equation",
+    "|Elu|1|1|1|1|1|||alpha,consumed_inputs",
+    "|Elu|6|1|1|1|1|||alpha",
+    "|Equal|1|2|2|1|1|||axis,broadcast",
+    "|Equal|7|2|2|1|1|||",
+    "|Equal|11|2|2|1|1|||",
+    "|Equal|13|2|2|1|1|||",
+    "|Equal|19|2|2|1|1|||",
+    "|Erf|9|1|1|1|1|||",
+    "|Erf|13|1|1|1|1|||",
+    "|Exp|1|1|1|1|1|||consumed_inputs",
+    "|Exp|6|1|1|1|1|||",
+    "|Exp|13|1|1|1|1|||",
+    "|Expand|8|2|2|1|1|||",
+    "|Expand|13|2|2|1|1|||",
+    "|EyeLike|9|1|1|1|1|||dtype,k",
+    "|Flatten|1|1|1|1|1|||axis",
+    "|Flatten|9|1|1|1|1|||axis",
+    "|Flatten|11|1|1|1|1|||axis",
+    "|Flatten|13|1|1|1|1|||axis",
+    "|Flatten|21|1|1|1|1|||axis",
+    "|Floor|1|1|1|1|1|||consumed_inputs",
+    "|Floor|6|1|1|1|1|||",
+    "|Floor|13|1|1|1|1|||",
+    "|GRU|1|3|6|2|2|||activation_alpha,activation_beta,activations,clip,direction,hidden_size,output_sequence",
+    "|GRU|3|3|6|0|2|||activation_alpha,activation_beta,activations,clip,direction,hidden_size,linear_before_reset,output_sequence",
+    "|GRU|7|3|6|0|2|||activation_alpha,activation_beta,activations,clip,direction,hidden_size,linear_before_reset",
+    "|GRU|14|3|6|0|2|||activation_alpha,activation_beta,activations,clip,direction,hidden_size,layout,linear_before_reset",
+    "|Gather|1|2|2|1|1|||axis",
+    "|Gather|11|2|2|1|1|||axis",
+    "|Gather|13|2|2|1|1|||axis",
+    "|GatherElements|11|2|2|1|1|||axis",
+    "|GatherElements|13|2|2|1|1|||axis",
+    "|GatherND|11|2|2|1|1|||",
+    "|GatherND|12|2|2|1|1|||batch_dims",
+    "|GatherND|13|2|2|1|1|||batch_dims",
+    "|Gelu|20|1|1|1|1|||approximate",
+    "|Gemm|1|3|3|1|1|||alpha,beta,broadcast,transA,transB",
+    "|Gemm|6|3|3|1|1|||alpha,beta,broadcast,transA,transB",
+    "|Gemm|7|3|3|1|1|||alpha,beta,transA,transB",
+    "|Gemm|9|3|3|1|1|||alpha,beta,transA,transB",
+    "|Gemm|11|2|3|1|1|||alpha,beta,transA,transB",
+    "|Gemm|13|2|3|1|1|||alpha,beta,transA,transB",
+    "|GlobalAveragePool|1|1|1|1|1|||",
+    "|GlobalLpPool|1|1|1|1|1|||p",
+    "|GlobalLpPool|2|1|1|1|1|||p",
+    "|GlobalMaxPool|1|1|1|1|1|||",
+    "|Greater|1|2|2|1|1|||axis,broadcast",
+    "|Greater|7|2|2|1|1|||",
+    "|Greater|9|2|2|1|1|||",
+    "|Greater|13|2|2|1|1|||",
+    "|GreaterOrEqual|12|2|2|1|1|||",
+    "|GreaterOrEqual|16|2|2|1|1|||",
+    "|GridSample|16|2|2|1|1|||align_corners,mode,padding_mode",
+    "|GridSample|20|2|2|1|1|||align_corners,mode,padding_mode",
+    "|GroupNormalization|18|3|3|1|1|1||",
+    "|GroupNormalization|21|3|3|1|1||num_groups|epsilon,num_groups,stash_type",
+    "|HammingWindow|17|1|1|1|1|||output_datatype,periodic",
+    "|HannWindow|17|1|1|1|1|||output_datatype,periodic",
+    "|HardSigmoid|1|1|1|1|1|||alpha,beta,consumed_inputs",
+    "|HardSigmoid|6|1|1|1|1|||alpha,beta",
+    "|HardSwish|14|1|1|1|1|||",
+    "|Hardmax|1|1|1|1|1|||axis",
+    "|Hardmax|11|1|1|1|1|||axis",
+    "|Hardmax|13|1|1|1|1|||axis",
+    "|Identity|1|1|1|1|1|||",
+    "|Identity|13|1|1|1|1|||",
+    "|Identity|14|1|1|1|1|||",
+    "|Identity|16|1|1|1|1|||",
+    "|Identity|19|1|1|1|1|||",
+    "|Identity|21|1|1|1|1|||",
+    "|If|1|1|1|1|-1||else_branch,then_branch|else_branch,then_branch",
+    "|If|11|1|1|1|-1||else_branch,then_branch|else_branch,then_branch",
+    "|If|13|1|1|1|-1||else_branch,then_branch|else_branch,then_branch",
+    "|If|16|1|1|1|-1||else_branch,then_branch|else_branch,then_branch",
+    "|If|19|1|1|1|-1||else_branch,then_branch|else_branch,then_branch",
+    "|If|21|1|1|1|-1||else_branch,then_branch|else_branch,then_branch",
+    "|ImageDecoder|20|1|1|1|1|||pixel_format",
+    "|InstanceNormalization|1|3|3|1|1|||consumed_inputs,epsilon",
+    "|InstanceNormalization|6|3|3|1|1|||epsilon",
+    "|IsInf|10|1|1|1|1|||detect_negative,detect_positive",
+    "|IsInf|20|1|1|1|1|||detect_negative,detect_positive",
+    "|IsNaN|9|1|1|1|1|||",
+    "|IsNaN|13|1|1|1|1|||",
+    "|IsNaN|20|1|1|1|1|||",
+    "|LRN|1|1|1|1|1||size|alpha,beta,bias,size",
+    "|LRN|13|1|1|1|1||size|alpha,beta,bias,size",
+    "|LSTM|1|3|8|0|3|||activation_alpha,activation_beta,activations,clip,direction,hidden_size,input_forget,output_sequence",
+    "|LSTM|7|3|8|0|3|||activation_alpha,activation_beta,activations,clip,direction,hidden_size,input_forget",
+    "|LSTM|14|3|8|0|3|||activation_alpha,activation_beta,activations,clip,direction,hidden_size,input_forget,layout",
+    "|LayerNormalization|17|2|3|1|3|||axis,epsilon,stash_type",
+    "|LeakyRelu|1|1|1|1|1|||alpha,consumed_inputs",
+    "|LeakyRelu|6|1|1|1|1|||alpha",
+    "|LeakyRelu|16|1|1|1|1|||alpha",
+    "|Less|1|2|2|1|1|||axis,broadcast",
+    "|Less|7|2|2|1|1|||",
+    "|Less|9|2|2|1|1|||",
+    "|Less|13|2|2|1|1|||",
+    "|LessOrEqual|12|2|2|1|1|||",
+    "|LessOrEqual|16|2|2|1|1|||",
+    "|Log|1|1|1|1|1|||consumed_inputs",
+    "|Log|6|1|1|1|1|||",
+    "|Log|13|1|1|1|1|||",
+    "|LogSoftmax|1|1|1|1|1|||axis",
+    "|LogSoftmax|11|1|1|1|1|||axis",
+    "|LogSoftmax|13|1|1|1|1|||axis",
+    "|Loop|1|3|-1|1|-1||body|body",
+    "|Loop|11|2|-1|1|-1||body|body",
+    "|Loop|13|2|-1|1|-1||body|body",
+    "|Loop|16|2|-1|1|-1||body|body",
+    "|Loop|19|2|-1|1|-1||body|body",
+    "|Loop|21|2|-1|1|-1||body|body",
+    "|LpNormalization|1|1|1|1|1|||axis,p",
+    "|LpPool|1|1|1|1|1|||auto_pad,kernel_shape,p,pads,strides",
+    "|LpPool|2|1|1|1|1||kernel_shape|auto_pad,kernel_shape,p,pads,strides",
+    "|LpPool|11|1|1|1|1||kernel_shape|auto_pad,kernel_shape,p,pads,strides",
+    "|LpPool|18|1|1|1|1||kernel_shape|auto_pad,ceil_mode,dilations,kernel_shape,p,pads,strides",
+    "|MatMul|1|2|2|1|1|||",
+    "|MatMul|9|2|2|1|1|||",
+    "|MatMul|13|2|2|1|1|||",
+    "|MatMulInteger|10|2|4|1|1|||",
+    "|Max|1|1|-1|1|1|||consumed_inputs",
+    "|Max|6|1|-1|1|1|||",
+    "|Max|8|1|-1|1|1|||",
+    "|Max|12|1|-1|1|1|||",
+    "|Max|13|1|-1|1|1|||",
+    "|MaxPool|1|1|1|1|1||kernel_shape|auto_pad,kernel_shape,pads,strides",
+    "|MaxPool|8|1|1|1|2||kernel_shape|auto_pad,kernel_shape,pads,storage_order,strides",
+    "|MaxPool|10|1|1|1|2||kernel_shape|auto_pad,ceil_mode,dilations,kernel_shape,pads,storage_order,strides",
+    "|MaxPool|11|1|1|1|2||kernel_shape|auto_pad,ceil_mode,dilations,kernel_shape,pads,storage_order,strides",
+    "|MaxPool|12|1|1|1|2||kernel_shape|auto_pad,ceil_mode,dilations,kernel_shape,pads,storage_order,strides",
+    "|MaxRoiPool|1|2|2|1|1||pooled_shape|pooled_shape,spatial_scale",
+    "|MaxUnpool|9|2|3|1|1||kernel_shape|kernel_shape,pads,strides",
+    "|MaxUnpool|11|2|3|1|1||kernel_shape|kernel_shape,pads,strides",
+    "|Mean|1|1|-1|1|1|||consumed_inputs",
+    "|Mean|6|1|-1|1|1|||",
+    "|Mean|8|1|-1|1|1|||",
+    "|Mean|13|1|-1|1|1|||",
+    "|MeanVarianceNormalization|9|1|1|1|1|||axes",
+    "|MeanVarianceNormalization|13|1|1|1|1|||axes",
+    "|MelWeightMatrix|17|5|5|1|1|||output_datatype",
+    "|Min|1|1|-1|1|1|||consumed_inputs",
+    "|Min|6|1|-1|1|1|||",
+    "|Min|8|1|-1|1|1|||",
+    "|Min|12|1|-1|1|1|||",
+    "|Min|13|1|-1|1|1|||",
+    "|Mish|18|1|1|1|1|||",
+    "|Mod|10|2|2|1|1|||fmod",
+    "|Mod|13|2|2|1|1|||fmod",
+    "|Mul|1|2|2|1|1|||axis,broadcast,consumed_inputs",
+    "|Mul|6|2|2|1|1|||axis,broadcast",
+    "|Mul|7|2|2|1|1|||",
+    "|Mul|13|2|2|1|1|||",
+    "|Mul|14|2|2|1|1|||",
+    "|Multinomial|7|1|1|1|1|||dtype,sample_size,seed",
+    "|Neg|1|1|1|1|1|||consumed_inputs",
+    "|Neg|6|1|1|1|1|||",
+    "|Neg|13|1|1|1|1|||",
+    "|NegativeLogLikelihoodLoss|12|2|3|1|1|||ignore_index,reduction",
+    "|NegativeLogLikelihoodLoss|13|2|3|1|1|||ignore_index,reduction",
+    "|NonMaxSuppression|10|2|5|1|1|||center_point_box",
+    "|NonMaxSuppression|11|2|5|1|1|||center_point_box",
+    "|NonZero|9|1|1|1|1|||",
+    "|NonZero|13|1|1|1|1|||",
+    "|Not|1|1|1|1|1|||",
+    "|OneHot|9|3|3|1|1|||axis",
+    "|OneHot|11|3|3|1|1|||axis",
+    "|Optional|15|0|1|1|1|||type",
+    "|OptionalGetElement|15|1|1|1|1|||",
+    "|OptionalGetElement|18|1|1|1|1|||",
+    "|OptionalHasElement|15|1|1|1|1|||",
+    "|OptionalHasElement|18|0|1|1|1|||",
+    "|Or|1|2|2|1|1|||axis,broadcast",
+    "|Or|7|2|2|1|1|||",
+    "|PRelu|1|2|2|1|1|||consumed_inputs",
+    "|PRelu|6|2|2|1|1|||",
+    "|PRelu|7|2|2|1|1|||",
+    "|PRelu|9|2|2|1|1|||",
+    "|PRelu|16|2|2|1|1|||",
+    "|Pad|1|1|1|1|1||paddings|mode,paddings,value",
+    "|Pad|2|1|1|1|1||pads|mode,pads,value",
+    "|Pad|11|2|3|1|1|||mode",
+    "|Pad|13|2|3|1|1|||mode",
+    "|Pad|18|2|4|1|1|||mode",
+    "|Pad|19|2|4|1|1|||mode",
+    "|Pad|21|2|4|1|1|||mode",
+    "|Pow|1|2|2|1|1|||axis,broadcast",
+    "|Pow|7|2|2|1|1|||",
+    "|Pow|12|2|2|1|1|||",
+    "|Pow|13|2|2|1|1|||",
+    "|Pow|15|2|2|1|1|||",
+    "|QLinearConv|10|8|9|1|1|||auto_pad,dilations,group,kernel_shape,pads,strides",
+    "|QLinearMatMul|10|8|8|1|1|||",
+    "|QLinearMatMul|21|8|8|1|1|||",
+    "|QuantizeLinear|10|2|3|1|1|||",
+    "|QuantizeLinear|13|2|3|1|1|||axis",
+    "|QuantizeLinear|19|2|3|1|1|||axis,saturate",
+    "|QuantizeLinear|21|2|3|1|1|||axis,block_size,output_dtype,saturate",
+    "|RNN|1|3|6|0|2|||activation_alpha,activation_beta,activations,clip,direction,hidden_size,output_sequence",
+    "|RNN|7|3|6|0|2|||activation_alpha,activation_beta,activations,clip,direction,hidden_size",
+    "|RNN|14|3|6|0|2|||activation_alpha,activation_beta,activations,clip,direction,hidden_size,layout",
+    "|RandomNormal|1|0|0|1|1||shape|dtype,mean,scale,seed,shape",
+    "|RandomNormalLike|1|1|1|1|1|||dtype,mean,scale,seed",
+    "|RandomUniform|1|0|0|1|1||shape|dtype,high,low,seed,shape",
+    "|RandomUniformLike|1|1|1|1|1|||dtype,high,low,seed",
+    "|Range|11|3|3|1|1|||",
+    "|Reciprocal|1|1|1|1|1|||consumed_inputs",
+    "|Reciprocal|6|1|1|1|1|||",
+    "|Reciprocal|13|1|1|1|1|||",
+    "|ReduceL1|1|1|1|1|1|||axes,keepdims",
+    "|ReduceL1|11|1|1|1|1|||axes,keepdims",
+    "|ReduceL1|13|1|1|1|1|||axes,keepdims",
+    "|ReduceL1|18|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|ReduceL2|1|1|1|1|1|||axes,keepdims",
+    "|ReduceL2|11|1|1|1|1|||axes,keepdims",
+    "|ReduceL2|13|1|1|1|1|||axes,keepdims",
+    "|ReduceL2|18|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|ReduceLogSum|1|1|1|1|1|||axes,keepdims",
+    "|ReduceLogSum|11|1|1|1|1|||axes,keepdims",
+    "|ReduceLogSum|13|1|1|1|1|||axes,keepdims",
+    "|ReduceLogSum|18|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|ReduceLogSumExp|1|1|1|1|1|||axes,keepdims",
+    "|ReduceLogSumExp|11|1|1|1|1|||axes,keepdims",
+    "|ReduceLogSumExp|13|1|1|1|1|||axes,keepdims",
+    "|ReduceLogSumExp|18|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|ReduceMax|1|1|1|1|1|||axes,keepdims",
+    "|ReduceMax|11|1|1|1|1|||axes,keepdims",
+    "|ReduceMax|12|1|1|1|1|||axes,keepdims",
+    "|ReduceMax|13|1|1|1|1|||axes,keepdims",
+    "|ReduceMax|18|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|ReduceMax|20|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|ReduceMean|1|1|1|1|1|||axes,keepdims",
+    "|ReduceMean|11|1|1|1|1|||axes,keepdims",
+    "|ReduceMean|13|1|1|1|1|||axes,keepdims",
+    "|ReduceMean|18|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|ReduceMin|1|1|1|1|1|||axes,keepdims",
+    "|ReduceMin|11|1|1|1|1|||axes,keepdims",
+    "|ReduceMin|12|1|1|1|1|||axes,keepdims",
+    "|ReduceMin|13|1|1|1|1|||axes,keepdims",
+    "|ReduceMin|18|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|ReduceMin|20|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|ReduceProd|1|1|1|1|1|||axes,keepdims",
+    "|ReduceProd|11|1|1|1|1|||axes,keepdims",
+    "|ReduceProd|13|1|1|1|1|||axes,keepdims",
+    "|ReduceProd|18|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|ReduceSum|1|1|1|1|1|||axes,keepdims",
+    "|ReduceSum|11|1|1|1|1|||axes,keepdims",
+    "|ReduceSum|13|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|ReduceSumSquare|1|1|1|1|1|||axes,keepdims",
+    "|ReduceSumSquare|11|1|1|1|1|||axes,keepdims",
+    "|ReduceSumSquare|13|1|1|1|1|||axes,keepdims",
+    "|ReduceSumSquare|18|1|2|1|1|||keepdims,noop_with_empty_axes",
+    "|RegexFullMatch|20|1|1|1|1|||pattern",
+    "|Relu|1|1|1|1|1|||consumed_inputs",
+    "|Relu|6|1|1|1|1|||",
+    "|Relu|13|1|1|1|1|||",
+    "|Relu|14|1|1|1|1|||",
+    "|Reshape|1|1|1|1|1|||consumed_inputs,shape",
+    "|Reshape|5|2|2|1|1|||",
+    "|Reshape|13|2|2|1|1|||",
+    "|Reshape|14|2|2|1|1|||allowzero",
+    "|Reshape|19|2|2|1|1|||allowzero",
+    "|Reshape|21|2|2|1|1|||allowzero",
+    "|Resize|10|2|2|1|1|||mode",
+    "|Resize|11|3|4|1|1|||coordinate_transformation_mode,cubic_coeff_a,exclude_outside,extrapolation_value,mode,nearest_mode",
+    "|Resize|13|1|4|1|1|||coordinate_transformation_mode,cubic_coeff_a,exclude_outside,extrapolation_value,mode,nearest_mode",
+    "|Resize|18|1|4|1|1|||antialias,axes,coordinate_transformation_mode,cubic_coeff_a,exclude_outside,extrapolation_value,keep_aspect_ratio_policy,mode,nearest_mode",
+    "|Resize|19|1|4|1|1|||antialias,axes,coordinate_transformation_mode,cubic_coeff_a,exclude_outside,extrapolation_value,keep_aspect_ratio_policy,mode,nearest_mode",
+    "|ReverseSequence|10|2|2|1|1|||batch_axis,time_axis",
+    "|RoiAlign|10|3|3|1|1|||mode,output_height,output_width,sampling_ratio,spatial_scale",
+    "|RoiAlign|16|3|3|1|1|||coordinate_transformation_mode,mode,output_height,output_width,sampling_ratio,spatial_scale",
+    "|Round|11|1|1|1|1|||",
+    "|STFT|17|2|4|1|1|||onesided",
+    "|Scan|8|2|-1|1|-1||body,num_scan_inputs|body,directions,num_scan_inputs",
+    "|Scan|9|1|-1|1|-1||body,num_scan_inputs|body,num_scan_inputs,scan_input_axes,scan_input_directions,scan_output_axes,scan_output_directions",
+    "|Scan|11|1|-1|1|-1||body,num_scan_inputs|body,num_scan_inputs,scan_input_axes,scan_input_directions,scan_output_axes,scan_output_directions",
+    "|Scan|16|1|-1|1|-1||body,num_scan_inputs|body,num_scan_inputs,scan_input_axes,scan_input_directions,scan_output_axes,scan_output_directions",
+    "|Scan|19|1|-1|1|-1||body,num_scan_inputs|body,num_scan_inputs,scan_input_axes,scan_input_directions,scan_output_axes,scan_output_directions",
+    "|Scan|21|1|-1|1|-1||body,num_scan_inputs|body,num_scan_inputs,scan_input_axes,scan_input_directions,scan_output_axes,scan_output_directions",
+    "|Scatter|9|3|3|1|1|||axis",
+    "|Scatter|11|3|3|1|1|1||",
+    "|ScatterElements|11|3|3|1|1|||axis",
+    "|ScatterElements|13|3|3|1|1|||axis",
+    "|ScatterElements|16|3|3|1|1|||axis,reduction",
+    "|ScatterElements|18|3|3|1|1|||axis,reduction",
+    "|ScatterND|11|3|3|1|1|||",
+    "|ScatterND|13|3|3|1|1|||",
+    "|ScatterND|16|3|3|1|1|||reduction",
+    "|ScatterND|18|3|3|1|1|||reduction",
+    "|Selu|1|1|1|1|1|||alpha,consumed_inputs,gamma",
+    "|Selu|6|1|1|1|1|||alpha,gamma",
+    "|SequenceAt|11|2|2|1|1|||",
+    "|SequenceConstruct|11|1|-1|1|1|||",
+    "|SequenceEmpty|11|0|0|1|1|||dtype",
+    "|SequenceErase|11|1|2|1|1|||",
+    "|SequenceInsert|11|2|3|1|1|||",
+    "|SequenceLength|11|1|1|1|1|||",
+    "|SequenceMap|17|1|-1|1|-1||body|body",
+    "|Shape|1|1|1|1|1|||",
+    "|Shape|13|1|1|1|1|||",
+    "|Shape|15|1|1|1|1|||end,start",
+    "|Shape|19|1|1|1|1|||end,start",
+    "|Shape|21|1|1|1|1|||end,start",
+    "|Shrink|9|1|1|1|1|||bias,lambd",
+    "|Sigmoid|1|1|1|1|1|||consumed_inputs",
+    "|Sigmoid|6|1|1|1|1|||",
+    "|Sigmoid|13|1|1|1|1|||",
+    "|Sign|9|1|1|1|1|||",
+    "|Sign|13|1|1|1|1|||",
+    "|Sin|7|1|1|1|1|||",
+    "|Sinh|9|1|1|1|1|||",
+    "|Size|1|1|1|1|1|||",
+    "|Size|13|1|1|1|1|||",
+    "|Size|19|1|1|1|1|||",
+    "|Size|21|1|1|1|1|||",
+    "|Slice|1|1|1|1|1||ends,starts|axes,ends,starts",
+    "|Slice|10|3|5|1|1|||",
+    "|Slice|11|3|5|1|1|||",
+    "|Slice|13|3|5|1|1|||",
+    "|Softmax|1|1|1|1|1|||axis",
+    "|Softmax|11|1|1|1|1|||axis",
+    "|Softmax|13|1|1|1|1|||axis",
+    "|SoftmaxCrossEntropyLoss|12|2|3|1|2|||ignore_index,reduction",
+    "|SoftmaxCrossEntropyLoss|13|2|3|1|2|||ignore_index,reduction",
+    "|Softplus|1|1|1|1|1|||",
+    "|Softsign|1|1|1|1|1|||",
+    "|SpaceToDepth|1|1|1|1|1||blocksize|blocksize",
+    "|SpaceToDepth|13|1|1|1|1||blocksize|blocksize",
+    "|Split|1|1|2|1|-1|||axis,split",
+    "|Split|2|1|1|1|-1|||axis,split",
+    "|Split|11|1|1|1|-1|||axis,split",
+    "|Split|13|1|2|1|-1|||axis",
+    "|Split|18|1|2|1|-1|||axis,num_outputs",
+    "|SplitToSequence|11|1|2|1|1|||axis,keepdims",
+    "|Sqrt|1|1|1|1|1|||consumed_inputs",
+    "|Sqrt|6|1|1|1|1|||",
+    "|Sqrt|13|1|1|1|1|||",
+    "|Squeeze|1|1|1|1|1|||axes",
+    "|Squeeze|11|1|1|1|1|||axes",
+    "|Squeeze|13|1|2|1|1|||",
+    "|Squeeze|21|1|2|1|1|||",
+    "|StringConcat|20|2|2|1|1|||",
+    "|StringNormalizer|10|1|1|1|1|||case_change_action,is_case_sensitive,locale,stopwords",
+    "|StringSplit|20|1|1|2|2|||delimiter,maxsplit",
+    "|Sub|1|2|2|1|1|||axis,broadcast,consumed_inputs",
+    "|Sub|6|2|2|1|1|||axis,broadcast",
+    "|Sub|7|2|2|1|1|||",
+    "|Sub|13|2|2|1|1|||",
+    "|Sub|14|2|2|1|1|||",
+    "|Sum|1|1|-1|1|1|||consumed_inputs",
+    "|Sum|6|1|-1|1|1|||",
+    "|Sum|8|1|-1|1|1|||",
+    "|Sum|13|1|-1|1|1|||",
+    "|Tan|7|1|1|1|1|||",
+    "|Tanh|1|1|1|1|1|||consumed_inputs",
+    "|Tanh|6|1|1|1|1|||",
+    "|Tanh|13|1|1|1|1|||",
+    "|TfIdfVectorizer|9|1|1|1|1||max_gram_length,max_skip_count,min_gram_length,mode,ngram_counts,ngram_indexes|max_gram_length,max_skip_count,min_gram_length,mode,ngram_counts,ngram_indexes,pool_int64s,pool_strings,weights",
+    "|ThresholdedRelu|10|1|1|1|1|||alpha",
+    "|Tile|1|3|3|1|1|||",
+    "|Tile|6|2|2|1|1|||",
+    "|Tile|13|2|2|1|1|||",
+    "|TopK|1|1|1|2|2||k|axis,k",
+    "|TopK|10|2|2|2|2|||axis",
+    "|TopK|11|2|2|2|2|||axis,largest,sorted",
+    "|Transpose|1|1|1|1|1|||perm",
+    "|Transpose|13|1|1|1|1|||perm",
+    "|Transpose|21|1|1|1|1|||perm",
+    "|Trilu|14|1|2|1|1|||upper",
+    "|Unique|11|1|1|1|4|||axis,sorted",
+    "|Unsqueeze|1|1|1|1|1||axes|axes",
+    "|Unsqueeze|11|1|1|1|1||axes|axes",
+    "|Unsqueeze|13|2|2|1|1|||",
+    "|Unsqueeze|21|2|2|1|1|||",
+    "|Upsample|1|1|1|1|1||height_scale,width_scale|height_scale,mode,width_scale",
+    "|Upsample|7|1|1|1|1||scales|mode,scales",
+    "|Upsample|9|2|2|1|1|||mode",
+    "|Upsample|10|2|2|1|1|1||",
+    "|Where|9|3|3|1|1|||",
+    "|Where|16|3|3|1|1|||",
+    "|Xor|1|2|2|1|1|||axis,broadcast",
+    "|Xor|7|2|2|1|1|||",
+    "ai.onnx.ml|ArrayFeatureExtractor|1|2|2|1|1|||",
+    "ai.onnx.ml|Binarizer|1|1|1|1|1|||threshold",
+    "ai.onnx.ml|CastMap|1|1|1|1|1|||cast_to,map_form,max_map",
+    "ai.onnx.ml|CategoryMapper|1|1|1|1|1|||cats_int64s,cats_strings,default_int64,default_string",
+    "ai.onnx.ml|DictVectorizer|1|1|1|1|1|||int64_vocabulary,string_vocabulary",
+    "ai.onnx.ml|FeatureVectorizer|1|1|-1|1|1|||inputdimensions",
+    "ai.onnx.ml|Imputer|1|1|1|1|1|||imputed_value_floats,imputed_value_int64s,replaced_value_float,replaced_value_int64",
+    "ai.onnx.ml|LabelEncoder|1|1|1|1|1|||classes_strings,default_int64,default_string",
+    "ai.onnx.ml|LabelEncoder|2|1|1|1|1|||default_float,default_int64,default_string,keys_floats,keys_int64s,keys_strings,values_floats,values_int64s,values_strings",
+    "ai.onnx.ml|LabelEncoder|4|1|1|1|1|||default_float,default_int64,default_string,default_tensor,keys_floats,keys_int64s,keys_strings,keys_tensor,values_floats,values_int64s,values_strings,values_tensor",
+    "ai.onnx.ml|LinearClassifier|1|1|1|2|2||coefficients|classlabels_ints,classlabels_strings,coefficients,intercepts,multi_class,post_transform",
+    "ai.onnx.ml|LinearRegressor|1|1|1|1|1|||coefficients,intercepts,post_transform,targets",
+    "ai.onnx.ml|Normalizer|1|1|1|1|1|||norm",
+    "ai.onnx.ml|OneHotEncoder|1|1|1|1|1|||cats_int64s,cats_strings,zeros",
+    "ai.onnx.ml|SVMClassifier|1|1|1|2|2|||classlabels_ints,classlabels_strings,coefficients,kernel_params,kernel_type,post_transform,prob_a,prob_b,rho,support_vectors,vectors_per_class",
+    "ai.onnx.ml|SVMRegressor|1|1|1|1|1|||coefficients,kernel_params,kernel_type,n_supports,one_class,post_transform,rho,support_vectors",
+    "ai.onnx.ml|Scaler|1|1|1|1|1|||offset,scale",
+    "ai.onnx.ml|TreeEnsemble|5|1|1|1|1||leaf_targetids,leaf_weights,nodes_falseleafs,nodes_falsenodeids,nodes_featureids,nodes_modes,nodes_splits,nodes_trueleafs,nodes_truenodeids,tree_roots|aggregate_function,leaf_targetids,leaf_weights,membership_values,n_targets,nodes_falseleafs,nodes_falsenodeids,nodes_featureids,nodes_hitrates,nodes_missing_value_tracks_true,nodes_modes,nodes_splits,nodes_trueleafs,nodes_truenodeids,post_transform,tree_roots",
+    "ai.onnx.ml|TreeEnsembleClassifier|1|1|1|2|2|||base_values,class_ids,class_nodeids,class_treeids,class_weights,classlabels_int64s,classlabels_strings,nodes_falsenodeids,nodes_featureids,nodes_hitrates,nodes_missing_value_tracks_true,nodes_modes,nodes_nodeids,nodes_treeids,nodes_truenodeids,nodes_values,post_transform",
+    "ai.onnx.ml|TreeEnsembleClassifier|3|1|1|2|2|||base_values,base_values_as_tensor,class_ids,class_nodeids,class_treeids,class_weights,class_weights_as_tensor,classlabels_int64s,classlabels_strings,nodes_falsenodeids,nodes_featureids,nodes_hitrates,nodes_hitrates_as_tensor,nodes_missing_value_tracks_true,nodes_modes,nodes_nodeids,nodes_treeids,nodes_truenodeids,nodes_values,nodes_values_as_tensor,post_transform",
+    "ai.onnx.ml|TreeEnsembleClassifier|5|1|1|2|2|1||",
+    "ai.onnx.ml|TreeEnsembleRegressor|1|1|1|1|1|||aggregate_function,base_values,n_targets,nodes_falsenodeids,nodes_featureids,nodes_hitrates,nodes_missing_value_tracks_true,nodes_modes,nodes_nodeids,nodes_treeids,nodes_truenodeids,nodes_values,post_transform,target_ids,target_nodeids,target_treeids,target_weights",
+    "ai.onnx.ml|TreeEnsembleRegressor|3|1|1|1|1|||aggregate_function,base_values,base_values_as_tensor,n_targets,nodes_falsenodeids,nodes_featureids,nodes_hitrates,nodes_hitrates_as_tensor,nodes_missing_value_tracks_true,nodes_modes,nodes_nodeids,nodes_treeids,nodes_truenodeids,nodes_values,nodes_values_as_tensor,post_transform,target_ids,target_nodeids,target_treeids,target_weights,target_weights_as_tensor",
+    "ai.onnx.ml|TreeEnsembleRegressor|5|1|1|1|1|1||",
+    "ai.onnx.ml|ZipMap|1|1|1|1|1|||classlabels_int64s,classlabels_strings"]

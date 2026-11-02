@@ -16,13 +16,22 @@
 // `ir_version`, so reading them by field number directly is faster and
 // is the honest description of what is happening.
 //
-// WHAT IS NOT UNDERSTOOD IS KEPT
+// WHAT IS NOT UNDERSTOOD IS KEPT, AT THE LEVEL THIS PACKAGE MODELS
 //
-// `pbunknown` holds every field this package does not model, and
-// `write` puts them back.  A model written by a newer ONNX, round
-// tripped through this package, comes out with its newer fields
-// intact — which is the difference between a tool people trust with
-// their weights and one they do not.
+// `pbunknown` holds every field of the MODEL message this package does
+// not model, and `write` puts them back.  A model written by a newer
+// ONNX, round tripped through this package, comes out with its newer
+// model-level fields intact — which is the difference between a tool
+// people trust with their weights and one they do not.
+//
+// The level below has nowhere to put one: `OnnxGraph`, `OnnxNode` and
+// `OnnxTensor` carry no unknown set, so a graph's `sparse_initializer`,
+// a node's `metadata_props`, or any field of those messages this
+// package does not model is stepped over on the way in and absent on
+// the way out.  The model level is where ONNX's own compatibility
+// story lives — `metadata_props`, `training_info`, `functions` and
+// `configuration` all sit there — and it is the level this package
+// keeps.
 //
 // THE TWO-GIGABYTE WALL
 //
@@ -38,8 +47,16 @@
 // models people care about; pretending the tensor is empty would be
 // worse.
 
+use onnxattr
 use onnxfault
 use onnxgraph
+use onnxopset
+use onnxtype
+use pbcodec
+use pberr
+use pbunknown
+use pbwire
+use pbwrite
 
 // How far a read will go before it refuses.
 pub struct OnnxReadLimits
@@ -66,7 +83,8 @@ pub struct OnnxReadLimits
 //     println("${onnxio.default_limits().max_depth}")   // 64
 // ```
 pub fn default_limits() -> OnnxReadLimits []
-    todo("onnx-nv.onnxio.default_limits")
+    OnnxReadLimits { max_depth: 64, max_bytes: PROTOBUF_MAX_MESSAGE,
+                     max_nodes: 1000000, read_tensor_data: true }
 
 // The limits that read the structure and skip the weights.
 //
@@ -82,7 +100,9 @@ pub fn default_limits() -> OnnxReadLimits []
 //     println("${onnxio.structure_only().read_tensor_data}")   // false
 // ```
 pub fn structure_only() -> OnnxReadLimits []
-    todo("onnx-nv.onnxio.structure_only")
+    let l = default_limits()
+    OnnxReadLimits { max_depth: l.max_depth, max_bytes: l.max_bytes,
+                     max_nodes: l.max_nodes, read_tensor_data: false }
 
 // The same limits with a different depth ceiling.
 //
@@ -93,7 +113,8 @@ pub fn structure_only() -> OnnxReadLimits []
 //     println("${onnxio.with_max_depth(onnxio.default_limits(), 8).max_depth}")   // 8
 // ```
 pub fn with_max_depth(l: OnnxReadLimits, n: Int) -> OnnxReadLimits []
-    todo("onnx-nv.onnxio.with_max_depth")
+    OnnxReadLimits { max_depth: n, max_bytes: l.max_bytes,
+                     max_nodes: l.max_nodes, read_tensor_data: l.read_tensor_data }
 
 // The same limits with a different byte ceiling.
 //
@@ -104,7 +125,8 @@ pub fn with_max_depth(l: OnnxReadLimits, n: Int) -> OnnxReadLimits []
 //     println("${onnxio.with_max_bytes(onnxio.default_limits(), 1024).max_bytes}")
 // ```
 pub fn with_max_bytes(l: OnnxReadLimits, n: Int) -> OnnxReadLimits []
-    todo("onnx-nv.onnxio.with_max_bytes")
+    OnnxReadLimits { max_depth: l.max_depth, max_bytes: n,
+                     max_nodes: l.max_nodes, read_tensor_data: l.read_tensor_data }
 
 // The model these bytes hold.
 //
@@ -118,7 +140,13 @@ pub fn with_max_bytes(l: OnnxReadLimits, n: Int) -> OnnxReadLimits []
 //         Err(e) => println(e.message())
 // ```
 pub fn read(src: Bytes, limits: OnnxReadLimits) -> Result<OnnxModel, OnnxFault> []
-    todo("onnx-nv.onnxio.read")
+    let size = bytes.len(src)
+    if size > limits.max_bytes
+        return Err(OnnxTooLarge(bytes: size, limit: limits.max_bytes))
+    let m = read_model(src, limits, 0, size, true)!
+    if list.len(m.graphs) == 0
+        return Err(OnnxNoGraph)
+    Ok(m)
 
 // The model's header without its graph: the IR version, the opset
 // imports, the producer.
@@ -138,7 +166,7 @@ pub fn read(src: Bytes, limits: OnnxReadLimits) -> Result<OnnxModel, OnnxFault> 
 //         Err(e) => println(e.message())
 // ```
 pub fn read_header(src: Bytes) -> Result<OnnxModel, OnnxFault> []
-    todo("onnx-nv.onnxio.read_header")
+    read_model(src, default_limits(), 0, bytes.len(src), false)
 
 // Whether these bytes look like an ONNX model.
 //
@@ -157,7 +185,11 @@ pub fn read_header(src: Bytes) -> Result<OnnxModel, OnnxFault> []
 //     println("${onnxio.looks_like_onnx(bytes.from_byte_list([0x08, 0x08]))}")
 // ```
 pub fn looks_like_onnx(src: Bytes) -> Bool []
-    todo("onnx-nv.onnxio.looks_like_onnx")
+    if bytes.len(src) == 0
+        return false
+    match pbwire.read_tag_at(src, 0)
+        Ok(t)  => t.tag.field == 1 and t.tag.wire == PbWireVarint
+        Err(_) => false
 
 // The model as bytes.
 //
@@ -176,7 +208,14 @@ pub fn looks_like_onnx(src: Bytes) -> Bool []
 //         Err(e)  => println(e.message())
 // ```
 pub fn write(m: OnnxModel) -> Result<Bytes, OnnxFault> []
-    todo("onnx-nv.onnxio.write")
+    require_writable(m)!
+    let size = model_len(m)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    write_model_into(m, var dst)!
+    if dst.pos() != size
+        // cov: skip — the length is sized from the same fields, in the same order, that this body writes; a disagreement is a defect in the pair and not a state a caller reaches (write)
+        core.panic.panic("onnxio.write: the sized and the written lengths disagree")
+    Ok(dst.finish())
 
 // How many bytes `write` would produce, without producing them.
 //
@@ -194,7 +233,8 @@ pub fn write(m: OnnxModel) -> Result<Bytes, OnnxFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn encoded_len(m: OnnxModel) -> Result<Int, OnnxFault> []
-    todo("onnx-nv.onnxio.encoded_len")
+    require_writable(m)!
+    Ok(model_len(m))
 
 // Whether the model would exceed protobuf's two-gigabyte message
 // ceiling.
@@ -209,7 +249,7 @@ pub fn encoded_len(m: OnnxModel) -> Result<Int, OnnxFault> []
 //     println("${onnxio.exceeds_protobuf_limit(onnxgraph.empty_model())}")   // false
 // ```
 pub fn exceeds_protobuf_limit(m: OnnxModel) -> Bool []
-    todo("onnx-nv.onnxio.exceeds_protobuf_limit")
+    model_len(m) > PROTOBUF_MAX_MESSAGE
 
 // The model with one external tensor's bytes supplied.
 //
@@ -230,7 +270,30 @@ pub fn exceeds_protobuf_limit(m: OnnxModel) -> Bool []
 // ```
 pub fn attach_external(m: OnnxModel, tensor_name: Str,
                        data: Bytes) -> Result<OnnxModel, OnnxFault> []
-    todo("onnx-nv.onnxio.attach_external")
+    var found = false
+    var graphs: [OnnxGraph] = []
+    for g in m.graphs
+        var tensors: [OnnxTensor] = []
+        for t in g.initializer
+            if t.name == tensor_name and not found
+                let want = onnxtype.tensor_byte_length(t)
+                if onnxtype.element_bytes(t.data_type) > 0 and bytes.len(data) != want
+                    return Err(OnnxTensorSizeMismatch(name: tensor_name,
+                        declared: bytes.len(data), from_dims: want))
+                found = true
+                list.push(tensors, OnnxTensor { name: t.name, data_type: t.data_type,
+                    dims: t.dims, raw: data, strings: t.strings, external_location: "" })
+            else
+                list.push(tensors, t)
+        list.push(graphs, OnnxGraph { name: g.name, node: g.node, input: g.input,
+            output: g.output, value_info: g.value_info, initializer: tensors, doc: g.doc })
+    if not found
+        return Err(OnnxTensorSizeMismatch(name: tensor_name,
+            declared: bytes.len(data), from_dims: 0))
+    Ok(OnnxModel { ir_version: m.ir_version, opset_import: m.opset_import,
+                   producer_name: m.producer_name, producer_version: m.producer_version,
+                   domain: m.domain, model_version: m.model_version, doc: m.doc,
+                   main: m.main, graphs: graphs, unknown: m.unknown })
 
 // Every external file the model refers to, without repeats.
 //
@@ -246,7 +309,13 @@ pub fn attach_external(m: OnnxModel, tensor_name: Str,
 //     println("${list.len(onnxio.external_files(onnxgraph.empty_model()))}")   // 0
 // ```
 pub fn external_files(m: OnnxModel) -> [Str] []
-    todo("onnx-nv.onnxio.external_files")
+    var out: [Str] = []
+    for g in m.graphs
+        for t in g.initializer
+            if onnxtype.is_external(t)
+                if not list.contains(out, t.external_location)
+                    list.push(out, t.external_location)
+    out
 
 // The model with its large initializers moved OUT into an external
 // file's worth of bytes.
@@ -268,7 +337,37 @@ pub fn external_files(m: OnnxModel) -> [Str] []
 // ```
 pub fn externalize(m: OnnxModel, location: Str,
                    threshold: Int) -> Result<(OnnxModel, Bytes), OnnxFault> []
-    todo("onnx-nv.onnxio.externalize")
+    if str.len(location) == 0
+        for g in m.graphs
+            for t in g.initializer
+                if moves(t, threshold)
+                    return Err(OnnxExternalData(name: t.name, location: location))
+    var total = 0
+    for g in m.graphs
+        for t in g.initializer
+            if moves(t, threshold)
+                total = total + bytes.len(t.raw)
+    var blob = bytes.zeros(total)
+    var at = 0
+    var graphs: [OnnxGraph] = []
+    for g in m.graphs
+        var tensors: [OnnxTensor] = []
+        for t in g.initializer
+            if moves(t, threshold)
+                bytes.copy_into(blob, at, t.raw, 0, bytes.len(t.raw))
+                at = at + bytes.len(t.raw)
+                list.push(tensors, OnnxTensor { name: t.name, data_type: t.data_type,
+                    dims: t.dims, raw: bytes.zeros(0), strings: t.strings,
+                    external_location: location })
+            else
+                list.push(tensors, t)
+        list.push(graphs, OnnxGraph { name: g.name, node: g.node, input: g.input,
+            output: g.output, value_info: g.value_info, initializer: tensors, doc: g.doc })
+    Ok((OnnxModel { ir_version: m.ir_version, opset_import: m.opset_import,
+                    producer_name: m.producer_name, producer_version: m.producer_version,
+                    domain: m.domain, model_version: m.model_version, doc: m.doc,
+                    main: m.main, graphs: graphs, unknown: m.unknown },
+                    blob))
 
 // protobuf-nv's limits that correspond to these.
 //
@@ -284,4 +383,1327 @@ pub fn externalize(m: OnnxModel, location: Str,
 //     println("${onnxio.protobuf_limits(onnxio.default_limits()).max_depth >= 1}")
 // ```
 pub fn protobuf_limits(l: OnnxReadLimits) -> PbLimits []
-    todo("onnx-nv.onnxio.protobuf_limits")
+    PbLimits { max_depth: l.max_depth, max_message: l.max_bytes, check_utf8: true }
+
+// ── the private half ─────────────────────────────────────────────────
+//
+// MEASURE, THEN WRITE, FROM THE SAME FIELDS
+//
+// `pbwire` and `pbwrite` answer a length for a field and a writer for
+// the same field, and this module pairs them: every message has a
+// `_len` that measures it and a `_into` that produces it, listing the
+// same fields in the same order.  A pair that drifted would write a
+// length prefix that points past the wrong bytes, so each writer
+// checks at the end that it wrote exactly what its own measure said,
+// and stops the process rather than handing back a file that is
+// quietly wrong.
+
+// Protobuf's own ceiling on one message: a length prefix is thirty-two
+// bits at most.
+const PROTOBUF_MAX_MESSAGE = 2147483647
+
+// The graph a model has when its graph table is empty, or when an
+// attribute's index names nothing.
+fn blank_graph() -> OnnxGraph
+    OnnxGraph { name: "", node: [], input: [], output: [], value_info: [],
+                initializer: [], doc: "" }
+
+// Whether an initializer is one `externalize` moves out.
+fn moves(t: OnnxTensor, threshold: Int) -> Bool
+    not onnxtype.is_external(t) and bytes.len(t.raw) > threshold
+
+// The graph an attribute's index names, or the main graph when the
+// index is out of range.
+//
+// An index out of range is a model a caller built by hand rather than
+// one this module read, and an empty graph is what `write` puts where
+// the subgraph was.
+fn graph_at(graphs: [OnnxGraph], index: Int) -> OnnxGraph
+    list.get(graphs, index, blank_graph())
+
+// A protobuf-nv decode refusal as this package's own.
+//
+// Every reason a read meets is a malformed-model reason: ONNX's
+// message shapes are fixed, so a payload that does not parse is not a
+// model, and protobuf-nv's own reason is more specific than anything
+// this package could say about it.
+fn not_protobuf(e: PbDecodeError) -> OnnxFault
+    OnnxNotProtobuf(offset: pberr.decode_offset(e), reason: e)
+
+// The same, for a call whose answer is propagated.
+fn as_onnx<T>(r: Result<T, PbDecodeError>) -> Result<T, OnnxFault>
+    match r
+        Ok(v)  => Ok(v)
+        Err(e) => Err(not_protobuf(e))
+
+// A field whose wire type is not the one `onnx.proto` gives it.
+fn wrong_wire(off: Int, field: Int, got: PbWireType, want: PbWireType) -> OnnxFault
+    OnnxWrongWireType(offset: off, field: field,
+                      found: pbwire.wire_code(got), expected: pbwire.wire_code(want))
+
+// Refuse a field that arrived on the wrong wire, before its payload is
+// read.
+//
+// A KNOWN FIELD NUMBER ON AN UNKNOWN WIRE IS A DIFFERENT FILE, not a
+// field to skip: `0x08` where a length-delimited graph was expected
+// means these bytes are not `ModelProto`, and saying so at the offset
+// is what makes the refusal usable.
+fn expect_wire(t: PbTag, want: PbWireType, off: Int) -> Result<Unit, OnnxFault>
+    if t.wire != want
+        return Err(wrong_wire(off, t.field, t.wire, want))
+    Ok(())
+
+// A length-delimited field's span, after checking the tag says the field
+// is length-delimited.  `off` is where the tag starts and `body` where its
+// payload does.
+fn bytes_field(src: Bytes, t: PbTagAt, off: Int, body: Int) -> Result<PbSpan, OnnxFault>
+    expect_wire(t.tag, PbWireBytes, off)!
+    as_onnx(pbwire.delimited_at(src, body))
+
+// A varint field's value, after checking the tag says the field is a
+// varint.
+fn varint_field(src: Bytes, t: PbTagAt, off: Int, body: Int) -> Result<PbIntAt, OnnxFault>
+    expect_wire(t.tag, PbWireVarint, off)!
+    as_onnx(pbwire.read_varint_at(src, body))
+
+// Step over one field this package does not model, and answer the
+// offset of the next one.
+fn skip_plain(src: Bytes, off: Int, t: PbTagAt) -> Result<Int, OnnxFault>
+    let payload = as_onnx(pbwire.skip_at(src, off + t.len, t.tag))!
+    Ok(off + t.len + payload)
+
+// A protobuf `string`, checked for UTF-8.
+//
+// ONNX says its strings are UTF-8; some exporters have written raw
+// bytes, and a string this package handed on unchecked would reach a
+// terminal or a log as mojibake.  `field` is the number the string
+// arrived at, so the refusal can name it.
+fn text_at(src: Bytes, start: Int, size: Int, field: Int) -> Result<Str, OnnxFault>
+    let bad = pbwire.first_non_utf8(src, start, size)
+    if bad >= 0
+        return Err(OnnxBadUtf8(offset: bad, field: field))
+    Ok(text_raw(src, start, size))
+
+// A length-delimited payload's bytes as text, with no UTF-8 check:
+// what a proto `bytes` field gets, and what a checked `string` is
+// built from.
+fn text_raw(src: Bytes, start: Int, size: Int) -> Str
+    bytes.to_str(bytes.slice(src, start, start + size))
+
+// Every element of a packed varint payload, appended to `out`.
+//
+// `packed_element_count` walks the whole run first, so a payload that
+// does not divide into whole elements is refused before the first
+// element is taken rather than part way through.
+fn push_packed_varints(src: Bytes, start: Int, size: Int, var out: [Int]) -> Result<Unit, OnnxFault>
+    let count = as_onnx(pbwire.packed_element_count(src, start, size, PbTypeInt64))!
+    var i = start
+    for k in 0..count
+        let v = as_onnx(pbwire.read_varint_at(src, i))!
+        list.push(out, v.value)
+        i = i + v.len
+    Ok(())
+
+// One occurrence of a repeated integral field, appended to `out`, and
+// the offset of the next field.
+//
+// BOTH ENCODINGS ARE LEGAL AND BOTH ARRIVE.  `onnx.proto` declares
+// `dims` unpacked and `ints` packed, and every protobuf parser must
+// accept either for either, so a reader that took only the declared
+// one would refuse files written by a conforming encoder.
+fn take_varints(src: Bytes, off: Int, t: PbTagAt, var out: [Int]) -> Result<Int, OnnxFault>
+    let body = off + t.len
+    if t.tag.wire == PbWireBytes
+        let span = as_onnx(pbwire.delimited_at(src, body))!
+        push_packed_varints(src, span.start, span.size, var out)!
+        return Ok(body + span.len)
+    if t.tag.wire != PbWireVarint
+        return Err(wrong_wire(off, t.tag.field, t.tag.wire, PbWireVarint))
+    let v = as_onnx(pbwire.read_varint_at(src, body))!
+    list.push(out, v.value)
+    Ok(body + v.len)
+
+// One occurrence of a repeated fixed-width field, kept as its bytes.
+//
+// A single `float` arrives as four bytes and a packed run as four
+// bytes an element; either way the payload is already the
+// little-endian shape `raw_data` uses, so nothing is unpacked and
+// repacked on the way to a tensor.
+fn take_bytes(src: Bytes, off: Int, t: PbTagAt, ft: PbFieldType,
+              var out: [Bytes]) -> Result<Int, OnnxFault>
+    let body = off + t.len
+    let w = pbwire.fixed_width(pbwire.wire_for(ft))
+    if t.tag.wire == PbWireBytes
+        let span = as_onnx(pbwire.delimited_at(src, body))!
+        as_onnx(pbwire.packed_element_count(src, span.start, span.size, ft))!
+        list.push(out, bytes.slice(src, span.start, span.start + span.size))
+        return Ok(body + span.len)
+    if t.tag.wire != pbwire.wire_for(ft)
+        return Err(wrong_wire(off, t.tag.field, t.tag.wire, pbwire.wire_for(ft)))
+    list.push(out, bytes.slice(src, body, body + w))
+    Ok(body + w)
+
+// Every element of a packed `floats` payload, appended to `out`.
+//
+// FLOAT ALONE.  The only repeated real an `AttributeProto` has is
+// `floats`; a tensor's `float_data` and `double_data` go through
+// `take_bytes`, which keeps their payload as the bytes it already is.
+fn push_packed_floats(src: Bytes, start: Int, size: Int,
+                      var out: [Float]) -> Result<Unit, OnnxFault>
+    let count = as_onnx(pbwire.packed_element_count(src, start, size, PbTypeFloat))!
+    var i = start
+    for k in 0..count
+        let v = as_onnx(pbwire.read_float_at(src, i))!
+        list.push(out, v.value)
+        i = i + v.len
+    Ok(())
+
+// One occurrence of a repeated `floats` field, appended to `out`, and
+// the offset of the next field.  A conforming encoder may write it
+// packed or one element per field.
+fn take_reals(src: Bytes, off: Int, t: PbTagAt, var out: [Float]) -> Result<Int, OnnxFault>
+    let body = off + t.len
+    if t.tag.wire == PbWireBytes
+        let span = as_onnx(pbwire.delimited_at(src, body))!
+        push_packed_floats(src, span.start, span.size, var out)!
+        return Ok(body + span.len)
+    if t.tag.wire != pbwire.wire_for(PbTypeFloat)
+        return Err(wrong_wire(off, t.tag.field, t.tag.wire, pbwire.wire_for(PbTypeFloat)))
+    let v = as_onnx(pbwire.read_float_at(src, body))!
+    list.push(out, v.value)
+    Ok(body + v.len)
+
+// The little-endian bytes of a repeated integral field, at the width
+// the tensor's OWN element type gives.
+//
+// THE ELEMENT TYPE DECIDES THE WIDTH, not the field the numbers
+// arrived in.  `int32_data` carries `INT32`, `INT16`, `INT8`, `UINT8`,
+// `BOOL`, `FLOAT16` and `BFLOAT16` — the proto says a `float16` is put
+// there "converted bit-wise to unsigned" — so six `INT8` elements are
+// six bytes and not twenty-four, and reading them as thirty-two bits
+// each is the mistake this function exists to not make.
+fn raw_of_ints(vs: [Int], width: Int) -> Bytes
+    var out = bytes.zeros(list.len(vs) * width)
+    var i = 0
+    for v in vs
+        match width
+            1 => bytes.set_u8(out, i, v)
+            2 => bytes.set_u16_le(out, i, v)
+            4 => bytes.set_u32_le(out, i, v)
+            8 => bytes.set_u64_le(out, i, v)
+            _ => ()
+        i = i + width
+    out
+
+// One `Dimension`: a size, a symbol, or neither.
+//
+// A DIMENSION WITH NEITHER IS NOT A ZERO.  `dim_value` absent and
+// `dim_param` absent is a dimension the exporter did not determine,
+// and thirty years of shape inference break when it is read as 0.
+fn read_dim(src: Bytes, start: Int, size: Int) -> Result<OnnxDim, OnnxFault>
+    var have_value = false
+    var value = 0
+    var have_param = false
+    var param = ""
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        match t.tag.field
+            1 =>
+                let v = varint_field(src, t, off, body)!
+                value = v.value
+                have_value = true
+                off = body + v.len
+            2 =>
+                let span = bytes_field(src, t, off, body)!
+                param = text_at(src, span.start, span.size, 2)!
+                have_param = true
+                off = body + span.len
+            _ =>
+                off = skip_plain(src, off, t)!
+    if have_value
+        return Ok(OnnxDimValue(value))
+    if have_param
+        return Ok(OnnxDimParam(param))
+    Ok(OnnxDimUnknown)
+
+// Every dimension of a `TensorShapeProto`, appended to `out`.
+//
+// A SHAPE FIELD THAT IS PRESENT AND EMPTY IS RANK ZERO, and the
+// difference survives because the field is not skipped when it is
+// empty: this is a scalar, and a tensor with no shape field at all is
+// a tensor whose rank nobody wrote down.
+fn read_shape(src: Bytes, start: Int, size: Int, var out: [OnnxDim]) -> Result<Unit, OnnxFault>
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        if t.tag.field == 1
+            let span = bytes_field(src, t, off, body)!
+            let d = read_dim(src, span.start, span.size)!
+            list.push(out, d)
+            off = body + span.len
+        else
+            off = skip_plain(src, off, t)!
+    Ok(())
+
+// An element type and a shape, the two halves of a `TypeProto` that
+// this package models.
+struct OnnxTypeRead
+    elem: OnnxDataType
+    dims: [OnnxDim]
+
+// A `TypeProto.Tensor`: the element type and the shape.
+fn read_tensor_type(src: Bytes, start: Int, size: Int) -> Result<OnnxTypeRead, OnnxFault>
+    var elem = OnnxUndefined
+    var dims: [OnnxDim] = []
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        match t.tag.field
+            1 =>
+                let v = varint_field(src, t, off, body)!
+                elem = onnxtype.type_of_code(v.value)!
+                off = body + v.len
+            2 =>
+                let span = bytes_field(src, t, off, body)!
+                read_shape(src, span.start, span.size, var dims)!
+                off = body + span.len
+            _ =>
+                off = skip_plain(src, off, t)!
+    Ok(OnnxTypeRead { elem: elem, dims: dims })
+
+// A `TypeProto`: what it says about a tensor, and nothing about a
+// sequence, a map, an optional or an opaque type.
+//
+// A value info whose type is a sequence or a map reads as an undefined
+// element type with no shape, which is this package saying "a value
+// of a kind I do not model" rather than guessing one.
+fn read_type_proto(src: Bytes, start: Int, size: Int) -> Result<OnnxTypeRead, OnnxFault>
+    var elem = OnnxUndefined
+    var dims: [OnnxDim] = []
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        if t.tag.field == 1
+            let span = bytes_field(src, t, off, body)!
+            let tt = read_tensor_type(src, span.start, span.size)!
+            elem = tt.elem
+            dims = tt.dims[:]
+            off = body + span.len
+        else
+            off = skip_plain(src, off, t)!
+    Ok(OnnxTypeRead { elem: elem, dims: dims })
+
+// A `ValueInfoProto`: a name, a type and a doc string.
+fn read_value_info(src: Bytes, start: Int, size: Int) -> Result<OnnxValueInfo, OnnxFault>
+    var name = ""
+    var elem = OnnxUndefined
+    var dims: [OnnxDim] = []
+    var doc = ""
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        match t.tag.field
+            1 =>
+                let span = bytes_field(src, t, off, body)!
+                name = text_at(src, span.start, span.size, 1)!
+                off = body + span.len
+            2 =>
+                let span = bytes_field(src, t, off, body)!
+                let tp = read_type_proto(src, span.start, span.size)!
+                elem = tp.elem
+                dims = tp.dims[:]
+                off = body + span.len
+            3 =>
+                let span = bytes_field(src, t, off, body)!
+                doc = text_at(src, span.start, span.size, 3)!
+                off = body + span.len
+            _ =>
+                off = skip_plain(src, off, t)!
+    Ok(OnnxValueInfo { name: name, elem_type: elem,
+                       shape: onnxtype.shape(dims), doc: doc })
+
+// An `OperatorSetIdProto`: a domain and a version.
+fn read_opset(src: Bytes, start: Int, size: Int) -> Result<OnnxOpsetImport, OnnxFault>
+    var domain = ""
+    var version = 0
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        match t.tag.field
+            1 =>
+                let span = bytes_field(src, t, off, body)!
+                domain = text_at(src, span.start, span.size, 1)!
+                off = body + span.len
+            2 =>
+                let v = varint_field(src, t, off, body)!
+                version = v.value
+                off = body + v.len
+            _ =>
+                off = skip_plain(src, off, t)!
+    Ok(OnnxOpsetImport { domain: domain, version: version })
+
+// The location a `StringStringEntryProto` names when its key is
+// "location", or `""`.
+fn external_location_of(src: Bytes, start: Int, size: Int) -> Result<Str, OnnxFault>
+    var key = ""
+    var value = ""
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        match t.tag.field
+            1 =>
+                let span = bytes_field(src, t, off, body)!
+                key = text_at(src, span.start, span.size, 1)!
+                off = body + span.len
+            2 =>
+                let span = bytes_field(src, t, off, body)!
+                value = text_raw(src, span.start, span.size)
+                off = body + span.len
+            _ =>
+                off = skip_plain(src, off, t)!
+    if key == "location"
+        return Ok(value)
+    Ok("")
+
+// A `TensorProto`: a name, a shape, an element type and the data.
+//
+// ONE REPRESENTATION IN, ONE OUT.  ONNX has five ways to hold a
+// tensor's numbers — `raw_data`, `float_data`, `int32_data`,
+// `int64_data`, `uint64_data`, `double_data` — and they are
+// alternatives, not accumulations: the FIRST data field the file
+// carried is the tensor's data and a later one is ignored, which is
+// what every protobuf implementation does with a `oneof`-shaped
+// group of optionals.
+//
+// Whatever came in, `raw` leaves as little-endian bytes of the
+// tensor's own element width, which is the layout ONNX documents for
+// `raw_data`; `write` puts them back as `raw_data`.
+fn read_tensor(src: Bytes, limits: OnnxReadLimits, start: Int,
+               size: Int) -> Result<OnnxTensor, OnnxFault>
+    var name = ""
+    var dims: [Int] = []
+    var code = 0
+    var raw = bytes.zeros(0)
+    var strings: [Str] = []
+    var location = ""
+    var ints: [Int] = []
+    var blocks: [Bytes] = []
+    var data_field = 0
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        match t.tag.field
+            1          =>
+                off = take_varints(src, off, t, var dims)!
+            2          =>
+                let v = varint_field(src, t, off, body)!
+                code = v.value
+                off = body + v.len
+            6          =>
+                expect_wire(t.tag, PbWireBytes, off)!
+                if limits.read_tensor_data
+                    let span = as_onnx(pbwire.delimited_at(src, body))!
+                    list.push(strings, text_raw(src, span.start, span.size))
+                    off = body + span.len
+                else
+                    off = skip_plain(src, off, t)!
+            8          =>
+                let span = bytes_field(src, t, off, body)!
+                name = text_at(src, span.start, span.size, 8)!
+                off = body + span.len
+            9          =>
+                let span = bytes_field(src, t, off, body)!
+                if limits.read_tensor_data and (data_field == 0 or data_field == 9)
+                    data_field = 9
+                    raw = bytes.slice(src, span.start, span.start + span.size)
+                off = body + span.len
+            13         =>
+                let span = bytes_field(src, t, off, body)!
+                location = external_location_of(src, span.start, span.size)!
+                off = body + span.len
+            14         =>
+                let v = varint_field(src, t, off, body)!
+                off = body + v.len
+            4 | 10     =>
+                if limits.read_tensor_data and (data_field == 0 or data_field == t.tag.field)
+                    data_field = t.tag.field
+                    off = take_bytes(src, off, t, reals_of(t.tag.field), var blocks)!
+                else
+                    off = skip_plain(src, off, t)!
+            5 | 7 | 11 =>
+                if limits.read_tensor_data and (data_field == 0 or data_field == t.tag.field)
+                    data_field = t.tag.field
+                    off = take_varints(src, off, t, var ints)!
+                else
+                    off = skip_plain(src, off, t)!
+            _          =>
+                off = skip_plain(src, off, t)!
+    if data_field == 4 or data_field == 10
+        raw = bytes.concat(blocks)
+    elif data_field == 5 or data_field == 7 or data_field == 11
+        raw = raw_of_ints(ints, onnxtype.element_bytes(onnxtype.type_of_code(code)!))
+    let t = OnnxTensor { name: name, data_type: onnxtype.type_of_code(code)!,
+                         dims: dims, raw: raw, strings: strings,
+                         external_location: location }
+    if limits.read_tensor_data and not onnxtype.is_external(t)
+        if onnxtype.element_bytes(t.data_type) > 0 and bytes.len(t.raw) != onnxtype.tensor_byte_length(t)
+            return Err(OnnxTensorSizeMismatch(name: t.name, declared: bytes.len(t.raw),
+                                              from_dims: onnxtype.tensor_byte_length(t)))
+    Ok(t)
+
+// The protobuf type of a `float_data` or a `double_data` field.
+fn reals_of(field: Int) -> PbFieldType
+    if field == 4
+        return PbTypeFloat
+    PbTypeDouble
+
+// The kind a `tp`/`type_protos`/`sparse_tensor`/`sparse_tensors` field
+// stands for, which the field number says and not the `type` field:
+// an attribute whose declared type and whose value disagree is exactly
+// what `onnxattr.is_consistent` reports.
+fn raw_kind_of(field: Int) -> OnnxAttrKind
+    if field == 14 or field == 15
+        return OnnxAttrKindTypeProto
+    OnnxAttrKindSparseTensor
+
+// An `AttributeProto`: a name, a declared type, one value, and a
+// reference when it is a function parameter.
+//
+// THE FIRST VALUE FIELD WINS and the rest are stepped over.  A file
+// whose `i` and `s` are both set is a file two implementations would
+// read differently; taking the first in field order is the reading
+// every protobuf decoder gives it, and the declared `type` is carried
+// beside the value so `onnxattr.is_consistent` can report the
+// disagreement instead of this reader resolving it silently.
+fn read_attribute(src: Bytes, limits: OnnxReadLimits, start: Int, size: Int, depth: Int,
+                  var graphs: [OnnxGraph]) -> Result<OnnxAttribute, OnnxFault>
+    if depth > limits.max_depth
+        return Err(OnnxTooDeep(limit: limits.max_depth))
+    var name = ""
+    var declared = OnnxAttrKindUndefined
+    var value = OnnxAttrRaw(OnnxAttrKindUndefined, bytes.zeros(0))
+    var ref_name = ""
+    var chosen = 0
+    var floats: [Float] = []
+    var ints: [Int] = []
+    var strings: [Str] = []
+    var tensors: [OnnxTensor] = []
+    var indices: [Int] = []
+    var raw = bytes.zeros(0)
+    var raw_kind = OnnxAttrKindUndefined
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        match t.tag.field
+            1                                                                           =>
+                let span = bytes_field(src, t, off, body)!
+                name = text_at(src, span.start, span.size, 1)!
+                off = body + span.len
+            13                                                                          =>
+                off = skip_plain(src, off, t)!
+            20                                                                          =>
+                let v = varint_field(src, t, off, body)!
+                declared = onnxattr.kind_of_code(v.value)
+                off = body + v.len
+            21                                                                          =>
+                let span = bytes_field(src, t, off, body)!
+                ref_name = text_at(src, span.start, span.size, 21)!
+                off = body + span.len
+            _ if is_value_field(t.tag.field) and (chosen == 0 or chosen == t.tag.field) =>
+                chosen = t.tag.field
+                match t.tag.field
+                    2  =>
+                        expect_wire(t.tag, PbWireFixed32, off)!
+                        let v = as_onnx(pbwire.read_float_at(src, body))!
+                        value = OnnxAttrFloat(v.value)
+                        off = body + v.len
+                    3  =>
+                        let v = varint_field(src, t, off, body)!
+                        value = OnnxAttrInt(v.value)
+                        off = body + v.len
+                    4  =>
+                        let span = bytes_field(src, t, off, body)!
+                        value = OnnxAttrString(text_raw(src, span.start, span.size))
+                        off = body + span.len
+                    5  =>
+                        let span = bytes_field(src, t, off, body)!
+                        value = OnnxAttrTensor(read_tensor(src, limits, span.start, span.size)!)
+                        off = body + span.len
+                    6  =>
+                        let span = bytes_field(src, t, off, body)!
+                        let g = read_graph(src, limits, span.start, span.size, depth + 1, var graphs)!
+                        list.push(graphs, g)
+                        value = OnnxAttrGraph(list.len(graphs) - 1)
+                        off = body + span.len
+                    7  =>
+                        off = take_reals(src, off, t, var floats)!
+                    8  =>
+                        off = take_varints(src, off, t, var ints)!
+                    9  =>
+                        let span = bytes_field(src, t, off, body)!
+                        list.push(strings, text_raw(src, span.start, span.size))
+                        off = body + span.len
+                    10 =>
+                        let span = bytes_field(src, t, off, body)!
+                        let t2 = read_tensor(src, limits, span.start, span.size)!
+                        list.push(tensors, t2)
+                        off = body + span.len
+                    11 =>
+                        let span = bytes_field(src, t, off, body)!
+                        let g = read_graph(src, limits, span.start, span.size, depth + 1, var graphs)!
+                        list.push(graphs, g)
+                        list.push(indices, list.len(graphs) - 1)
+                        off = body + span.len
+                    _  =>
+                        let payload = as_onnx(pbwire.skip_at(src, body, t.tag))!
+                        raw = bytes.slice(src, off, off + t.len + payload)
+                        raw_kind = raw_kind_of(t.tag.field)
+                        off = body + payload
+            _                                                                           =>
+                off = skip_plain(src, off, t)!
+    match chosen
+        0  =>
+            value = OnnxAttrRaw(declared, bytes.zeros(0))
+        2  => ()
+        3  => ()
+        4  => ()
+        5  => ()
+        6  => ()
+        7  =>
+            value = OnnxAttrFloats(floats)
+        8  =>
+            value = OnnxAttrInts(ints)
+        9  =>
+            value = OnnxAttrStrings(strings)
+        10 =>
+            value = OnnxAttrTensors(tensors)
+        11 =>
+            value = OnnxAttrGraphs(indices)
+        _  =>
+            value = OnnxAttrRaw(raw_kind, raw)
+    Ok(OnnxAttribute { name: name, declared: declared, value: value,
+                       ref_name: ref_name })
+
+// Whether a field number is one of `AttributeProto`'s value fields.
+fn is_value_field(field: Int) -> Bool
+    if field == 2 or field == 3 or field == 4 or field == 5 or field == 6
+        return true
+    if field == 7 or field == 8 or field == 9 or field == 10 or field == 11
+        return true
+    field == 14 or field == 15 or field == 22 or field == 23
+
+// A `NodeProto`: the op, its domain, its operands and its attributes.
+//
+// THE OPERANDS ARE IN FILE ORDER, and so is everything else here.
+// An operator's inputs are POSITIONAL — `Gemm`'s second input is its
+// weight, its third a bias that may be an empty name — so a list that
+// came back sorted, deduplicated or reordered would name a different
+// operator with the same op type.
+fn read_node(src: Bytes, limits: OnnxReadLimits, start: Int, size: Int, depth: Int,
+             var graphs: [OnnxGraph]) -> Result<OnnxNode, OnnxFault>
+    if depth > limits.max_depth
+        return Err(OnnxTooDeep(limit: limits.max_depth))
+    var name = ""
+    var op_type = ""
+    var domain = ""
+    var doc = ""
+    var inputs: [Str] = []
+    var outputs: [Str] = []
+    var attrs: [OnnxAttribute] = []
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        match t.tag.field
+            1 =>
+                let span = bytes_field(src, t, off, body)!
+                let s = text_at(src, span.start, span.size, 1)!
+                list.push(inputs, s)
+                off = body + span.len
+            2 =>
+                let span = bytes_field(src, t, off, body)!
+                let s = text_at(src, span.start, span.size, 2)!
+                list.push(outputs, s)
+                off = body + span.len
+            3 =>
+                let span = bytes_field(src, t, off, body)!
+                name = text_at(src, span.start, span.size, 3)!
+                off = body + span.len
+            4 =>
+                let span = bytes_field(src, t, off, body)!
+                op_type = text_at(src, span.start, span.size, 4)!
+                off = body + span.len
+            5 =>
+                let span = bytes_field(src, t, off, body)!
+                let a = read_attribute(src, limits, span.start, span.size, depth + 1, var graphs)!
+                list.push(attrs, a)
+                off = body + span.len
+            6 =>
+                let span = bytes_field(src, t, off, body)!
+                doc = text_at(src, span.start, span.size, 6)!
+                off = body + span.len
+            7 =>
+                let span = bytes_field(src, t, off, body)!
+                domain = text_at(src, span.start, span.size, 7)!
+                off = body + span.len
+            _ =>
+                off = skip_plain(src, off, t)!
+    Ok(OnnxNode { name: name, op_type: op_type, domain: domain, input: inputs,
+                  output: outputs, attribute: attrs, doc: doc })
+
+// A `GraphProto`: its nodes, its weights, what it takes and what it
+// produces.
+//
+// THE NODE CEILING IS CHECKED AS NODES ARRIVE, so a file that claims a
+// hundred million of them is refused instead of allocated.
+//
+// AN INITIALIZER WHOSE DATA IS IN ANOTHER FILE is refused here, when
+// the caller asked for tensor data at all: a `core` package cannot
+// open that file, and the caller reads it and calls
+// `attach_external`.  With `read_tensor_data` false the tensor reads
+// as its location and its shape, which is all a structure tool wants.
+fn read_graph(src: Bytes, limits: OnnxReadLimits, start: Int, size: Int, depth: Int,
+              var graphs: [OnnxGraph]) -> Result<OnnxGraph, OnnxFault>
+    if depth > limits.max_depth
+        return Err(OnnxTooDeep(limit: limits.max_depth))
+    var name = ""
+    var doc = ""
+    var nodes: [OnnxNode] = []
+    var inputs: [OnnxValueInfo] = []
+    var outputs: [OnnxValueInfo] = []
+    var infos: [OnnxValueInfo] = []
+    var initializers: [OnnxTensor] = []
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        match t.tag.field
+            1  =>
+                let span = bytes_field(src, t, off, body)!
+                let n = read_node(src, limits, span.start, span.size, depth + 1, var graphs)!
+                list.push(nodes, n)
+                if list.len(nodes) > limits.max_nodes
+                    return Err(OnnxTooLarge(bytes: list.len(nodes), limit: limits.max_nodes))
+                off = body + span.len
+            2  =>
+                let span = bytes_field(src, t, off, body)!
+                name = text_at(src, span.start, span.size, 2)!
+                off = body + span.len
+            5  =>
+                let span = bytes_field(src, t, off, body)!
+                let ten = read_tensor(src, limits, span.start, span.size)!
+                if limits.read_tensor_data and onnxtype.is_external(ten)
+                    return Err(OnnxExternalData(name: ten.name, location: ten.external_location))
+                list.push(initializers, ten)
+                off = body + span.len
+            10 =>
+                let span = bytes_field(src, t, off, body)!
+                doc = text_at(src, span.start, span.size, 10)!
+                off = body + span.len
+            11 =>
+                let span = bytes_field(src, t, off, body)!
+                let v = read_value_info(src, span.start, span.size)!
+                list.push(inputs, v)
+                off = body + span.len
+            12 =>
+                let span = bytes_field(src, t, off, body)!
+                let v = read_value_info(src, span.start, span.size)!
+                list.push(outputs, v)
+                off = body + span.len
+            13 =>
+                let span = bytes_field(src, t, off, body)!
+                let v = read_value_info(src, span.start, span.size)!
+                list.push(infos, v)
+                off = body + span.len
+            _  =>
+                off = skip_plain(src, off, t)!
+    Ok(OnnxGraph { name: name, node: nodes, input: inputs, output: outputs,
+                   value_info: infos, initializer: initializers, doc: doc })
+
+// A `ModelProto`: the header, the graph, and every subgraph a node
+// holds.
+//
+// `want_graph` false is `read_header`: the graph field is stepped over
+// rather than read, no unknown field is kept, and the model answers
+// with an empty one — a header read is a few hundred bytes in and out,
+// not a walk of a hundred thousand nodes.
+//
+// THE SUBGRAPHS GO IN THE MODEL'S FLAT TABLE, not in the node that
+// holds one: `OnnxAttrGraph` carries an index because a graph that
+// held its subgraphs directly would be a recursive value type, which
+// cannot be written.  The main graph is index 0 and every subgraph
+// follows in read order.
+fn read_model(src: Bytes, limits: OnnxReadLimits, start: Int, size: Int,
+              want_graph: Bool) -> Result<OnnxModel, OnnxFault>
+    if 0 > limits.max_depth
+        return Err(OnnxTooDeep(limit: limits.max_depth))
+    var ir = 0
+    var producer_name = ""
+    var producer_version = ""
+    var domain = ""
+    var model_version = 0
+    var doc = ""
+    var opsets: [OnnxOpsetImport] = []
+    var graphs: [OnnxGraph] = []
+    var u = pbunknown.empty()
+    var off = start
+    let end = start + size
+    while off < end
+        let t = as_onnx(pbwire.read_tag_at(src, off))!
+        let body = off + t.len
+        match t.tag.field
+            1               =>
+                let v = varint_field(src, t, off, body)!
+                ir = v.value
+                off = body + v.len
+            2               =>
+                let span = bytes_field(src, t, off, body)!
+                producer_name = text_at(src, span.start, span.size, 2)!
+                off = body + span.len
+            3               =>
+                let span = bytes_field(src, t, off, body)!
+                producer_version = text_at(src, span.start, span.size, 3)!
+                off = body + span.len
+            4               =>
+                let span = bytes_field(src, t, off, body)!
+                domain = text_at(src, span.start, span.size, 4)!
+                off = body + span.len
+            5               =>
+                let v = varint_field(src, t, off, body)!
+                model_version = v.value
+                off = body + v.len
+            6               =>
+                let span = bytes_field(src, t, off, body)!
+                doc = text_at(src, span.start, span.size, 6)!
+                off = body + span.len
+            7 if want_graph =>
+                let span = bytes_field(src, t, off, body)!
+                if list.len(graphs) == 0
+                    // The main graph's place is taken BEFORE its nodes are
+                    // read, because a node's subgraph is pushed onto this
+                    // table as it is met and would otherwise land in slot
+                    // zero with the main graph behind it.
+                    list.push(graphs, blank_graph())
+                    let g = read_graph(src, limits, span.start, span.size, 1, var graphs)!
+                    graphs[0] = g
+                off = body + span.len
+            8               =>
+                let span = bytes_field(src, t, off, body)!
+                let o = read_opset(src, span.start, span.size)!
+                list.push(opsets, o)
+                off = body + span.len
+            _               =>
+                let payload = as_onnx(pbwire.skip_at(src, body, t.tag))!
+                if want_graph
+                    u = pbunknown.keep(u, t.tag, bytes.slice(src, off, off + t.len + payload))
+                off = body + payload
+    if ir > onnxopset.ONNX_MAX_IR_VERSION
+        return Err(OnnxIrVersionTooNew(found: ir, supported: onnxopset.ONNX_MAX_IR_VERSION))
+    let table = if want_graph
+        graphs
+    else
+        [blank_graph()]
+    Ok(OnnxModel { ir_version: ir, opset_import: opsets,
+                   producer_name: producer_name, producer_version: producer_version,
+                   domain: domain, model_version: model_version, doc: doc,
+                   main: 0, graphs: table, unknown: u })
+
+// ── writing ──────────────────────────────────────────────────────────
+
+// A protobuf-nv write whose refusals this module has already ruled
+// out: every field is sized before it is written, so a bad field
+// number or a short buffer here is a defect in this module and not
+// something a model can cause.  The one refusal a model CAN cause is
+// text that is not UTF-8, which a read checks and a caller's own string
+// may not be.
+//
+// The answers of the impossible arms are never reached; a writer that
+// wrote fewer bytes than its measure promised is caught by the length
+// check at the end of the message it was writing.
+fn wrote(r: Result<Int, PbEncodeError>) -> Result<Int, OnnxFault>
+    match r
+        Ok(n)  => Ok(n)
+        Err(e) =>
+            match e
+                PbEncodeNotUtf8(field, at) => Err(OnnxBadUtf8(offset: at, field: field))
+                // cov: skip — every encode error this package's writer can raise is the UTF-8 refusal handled above; pbwrite's other errors need a field number or a buffer this package never builds, and every size is computed by the same table that writes the field
+                _                          => Ok(0)
+
+// Write a nested message: its key, its length, and the bytes its
+// writer answered.
+fn write_nested(field: Int, body: Bytes, var dst: Cursor) -> Result<Unit, OnnxFault>
+    let _ = wrote(pbwrite.write_message_field(field, body, var dst))!
+    Ok(())
+
+// A model that can be written at all.
+//
+// EVERY OPERATOR'S DOMAIN MUST BE IMPORTED.  A model whose nodes are
+// in a domain it does not import cannot be loaded by anything, and a
+// caller that built one by hand wants to be told before the file is
+// written rather than by a runtime.
+//
+// AN ATTRIBUTE'S DECLARED KIND MUST MATCH ITS VALUE, unless the value
+// is a kind this package keeps as raw bytes or the declaration is the
+// kind the file did not give.  A read model is consistent by
+// construction — the two are read from the file's own fields — so this
+// is the check a caller that built an attribute with `onnxattr` meets.
+fn require_writable(m: OnnxModel) -> Result<Unit, OnnxFault>
+    var imported: [Str] = []
+    for o in m.opset_import
+        list.push(imported, o.domain)
+    for g in m.graphs
+        for n in g.node
+            if not list.contains(imported, n.domain)
+                return Err(OnnxNoOpsetImport)
+            for a in n.attribute
+                check_attribute_kind(n.name, a)!
+    Ok(())
+
+// One attribute's declaration against its value.
+fn check_attribute_kind(node_name: Str, a: OnnxAttribute) -> Result<Unit, OnnxFault>
+    if str.len(a.ref_name) > 0
+        return Ok(())
+    let declared = onnxattr.kind_code(a.declared)
+    let given = onnxattr.kind_code(onnxattr.kind_of(a.value))
+    if declared == 0 or given == 0
+        return Ok(())
+    if declared != given
+        return Err(OnnxAttributeTypeMismatch(node: node_name, name: a.name,
+                   declared: onnxattr.kind_name(a.declared),
+                   given: onnxattr.kind_name(onnxattr.kind_of(a.value))))
+    Ok(())
+
+fn model_len(m: OnnxModel) -> Int
+    var n = 0
+    if m.ir_version != 0
+        n = n + pbwrite.varint_field_len(1, m.ir_version)
+    if str.len(m.producer_name) > 0
+        n = n + pbcodec.text_len(2, m.producer_name)
+    if str.len(m.producer_version) > 0
+        n = n + pbcodec.text_len(3, m.producer_version)
+    if str.len(m.domain) > 0
+        n = n + pbcodec.text_len(4, m.domain)
+    if m.model_version != 0
+        n = n + pbwrite.varint_field_len(5, m.model_version)
+    if str.len(m.doc) > 0
+        n = n + pbcodec.text_len(6, m.doc)
+    n = n + pbcodec.nested_len(7, graph_len(graph_at(m.graphs, m.main), m.graphs))
+    for o in m.opset_import
+        n = n + pbcodec.nested_len(8, opset_len(o))
+    n + pbunknown.encoded_len(m.unknown)
+
+fn write_model_into(m: OnnxModel, var dst: Cursor) -> Result<Unit, OnnxFault>
+    if m.ir_version != 0
+        let _ = wrote(pbwrite.write_varint_field(1, m.ir_version, var dst))!
+    if str.len(m.producer_name) > 0
+        let _ = wrote(pbwrite.write_string_field(2, m.producer_name, var dst))!
+    if str.len(m.producer_version) > 0
+        let _ = wrote(pbwrite.write_string_field(3, m.producer_version, var dst))!
+    if str.len(m.domain) > 0
+        let _ = wrote(pbwrite.write_string_field(4, m.domain, var dst))!
+    if m.model_version != 0
+        let _ = wrote(pbwrite.write_varint_field(5, m.model_version, var dst))!
+    if str.len(m.doc) > 0
+        let _ = wrote(pbwrite.write_string_field(6, m.doc, var dst))!
+    let graph_body = write_graph(graph_at(m.graphs, m.main), m.graphs)!
+    write_nested(7, graph_body, var dst)!
+    for o in m.opset_import
+        let opset_body = write_opset(o)!
+        write_nested(8, opset_body, var dst)!
+    let _ = wrote(pbunknown.write_into(m.unknown, var dst))!
+    Ok(())
+
+fn opset_len(o: OnnxOpsetImport) -> Int
+    var n = 0
+    if str.len(o.domain) > 0
+        n = n + pbcodec.text_len(1, o.domain)
+    if o.version != 0
+        n = n + pbwrite.varint_field_len(2, o.version)
+    n
+
+fn write_opset(o: OnnxOpsetImport) -> Result<Bytes, OnnxFault>
+    let size = opset_len(o)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    if str.len(o.domain) > 0
+        let _ = wrote(pbwrite.write_string_field(1, o.domain, var dst))!
+    if o.version != 0
+        let _ = wrote(pbwrite.write_varint_field(2, o.version, var dst))!
+    if dst.pos() != size
+        // cov: skip — the length is sized from the same fields, in the same order, that this body writes; a disagreement is a defect in the pair and not a state a caller reaches (write_opset)
+        core.panic.panic("onnxio.write_opset: the sized and the written lengths disagree")
+    Ok(dst.finish())
+
+fn graph_len(g: OnnxGraph, graphs: [OnnxGraph]) -> Int
+    var n = 0
+    for nd in g.node
+        n = n + pbcodec.nested_len(1, node_len(nd, graphs))
+    if str.len(g.name) > 0
+        n = n + pbcodec.text_len(2, g.name)
+    for t in g.initializer
+        n = n + pbcodec.nested_len(5, tensor_len(t))
+    if str.len(g.doc) > 0
+        n = n + pbcodec.text_len(10, g.doc)
+    for v in g.input
+        n = n + pbcodec.nested_len(11, value_info_len(v))
+    for v in g.output
+        n = n + pbcodec.nested_len(12, value_info_len(v))
+    for v in g.value_info
+        n = n + pbcodec.nested_len(13, value_info_len(v))
+    n
+
+fn write_graph(g: OnnxGraph, graphs: [OnnxGraph]) -> Result<Bytes, OnnxFault>
+    let size = graph_len(g, graphs)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    for nd in g.node
+        let body = write_node(nd, graphs)!
+        write_nested(1, body, var dst)!
+    if str.len(g.name) > 0
+        let _ = wrote(pbwrite.write_string_field(2, g.name, var dst))!
+    for t in g.initializer
+        let body = write_tensor(t)!
+        write_nested(5, body, var dst)!
+    if str.len(g.doc) > 0
+        let _ = wrote(pbwrite.write_string_field(10, g.doc, var dst))!
+    for v in g.input
+        let body = write_value_info(v)!
+        write_nested(11, body, var dst)!
+    for v in g.output
+        let body = write_value_info(v)!
+        write_nested(12, body, var dst)!
+    for v in g.value_info
+        let body = write_value_info(v)!
+        write_nested(13, body, var dst)!
+    if dst.pos() != size
+        // cov: skip — the length is sized from the same fields, in the same order, that this body writes; a disagreement is a defect in the pair and not a state a caller reaches (write_graph)
+        core.panic.panic("onnxio.write_graph: the sized and the written lengths disagree")
+    Ok(dst.finish())
+
+fn node_len(n: OnnxNode, graphs: [OnnxGraph]) -> Int
+    var total = 0
+    for name in n.input
+        total = total + pbcodec.text_len(1, name)
+    for name in n.output
+        total = total + pbcodec.text_len(2, name)
+    if str.len(n.name) > 0
+        total = total + pbcodec.text_len(3, n.name)
+    if str.len(n.op_type) > 0
+        total = total + pbcodec.text_len(4, n.op_type)
+    for a in n.attribute
+        total = total + pbcodec.nested_len(5, attribute_len(a, graphs))
+    if str.len(n.doc) > 0
+        total = total + pbcodec.text_len(6, n.doc)
+    if str.len(n.domain) > 0
+        total = total + pbcodec.text_len(7, n.domain)
+    total
+
+fn write_node(n: OnnxNode, graphs: [OnnxGraph]) -> Result<Bytes, OnnxFault>
+    let size = node_len(n, graphs)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    for name in n.input
+        let _ = wrote(pbwrite.write_string_field(1, name, var dst))!
+    for name in n.output
+        let _ = wrote(pbwrite.write_string_field(2, name, var dst))!
+    if str.len(n.name) > 0
+        let _ = wrote(pbwrite.write_string_field(3, n.name, var dst))!
+    if str.len(n.op_type) > 0
+        let _ = wrote(pbwrite.write_string_field(4, n.op_type, var dst))!
+    for a in n.attribute
+        let body = write_attribute(a, graphs)!
+        write_nested(5, body, var dst)!
+    if str.len(n.doc) > 0
+        let _ = wrote(pbwrite.write_string_field(6, n.doc, var dst))!
+    if str.len(n.domain) > 0
+        let _ = wrote(pbwrite.write_string_field(7, n.domain, var dst))!
+    if dst.pos() != size
+        // cov: skip — the length is sized from the same fields, in the same order, that this body writes; a disagreement is a defect in the pair and not a state a caller reaches (write_node)
+        core.panic.panic("onnxio.write_node: the sized and the written lengths disagree")
+    Ok(dst.finish())
+
+fn attribute_len(a: OnnxAttribute, graphs: [OnnxGraph]) -> Int
+    var n = 0
+    if str.len(a.name) > 0
+        n = n + pbcodec.text_len(1, a.name)
+    n = n + value_len(a.value, graphs)
+    if onnxattr.kind_code(a.declared) != 0
+        n = n + pbcodec.int_len(20, PbTypeInt32, onnxattr.kind_code(a.declared))
+    if str.len(a.ref_name) > 0
+        n = n + pbcodec.text_len(21, a.ref_name)
+    n
+
+fn write_attribute(a: OnnxAttribute, graphs: [OnnxGraph]) -> Result<Bytes, OnnxFault>
+    let size = attribute_len(a, graphs)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    if str.len(a.name) > 0
+        let _ = wrote(pbwrite.write_string_field(1, a.name, var dst))!
+    write_value(a.value, graphs, var dst)!
+    if onnxattr.kind_code(a.declared) != 0
+        let _ = wrote(pbcodec.write_int(20, PbTypeInt32, onnxattr.kind_code(a.declared), var dst))!
+    if str.len(a.ref_name) > 0
+        let _ = wrote(pbwrite.write_string_field(21, a.ref_name, var dst))!
+    if dst.pos() != size
+        // cov: skip — the length is sized from the same fields, in the same order, that this body writes; a disagreement is a defect in the pair and not a state a caller reaches (write_attribute)
+        core.panic.panic("onnxio.write_attribute: the sized and the written lengths disagree")
+    Ok(dst.finish())
+
+// How many bytes one attribute value occupies.
+//
+// AN EMPTY LIST OF NUMBERS IS STILL A LIST.  `Floats` and `Ints` with
+// no elements write an empty packed field rather than no field at all,
+// so that an empty `axes` comes back as `OnnxAttrInts` and not as a
+// value of unknown kind; the three list kinds that cannot be empty on
+// the wire — `Strings`, `Tensors`, `Graphs` — have no such spelling
+// and come back as raw bytes with their declared kind.
+fn value_len(v: OnnxAttrValue, graphs: [OnnxGraph]) -> Int
+    match v
+        OnnxAttrFloat(_)     => pbcodec.real_len(2, PbTypeFloat)
+        OnnxAttrInt(x)       => pbcodec.int_len(3, PbTypeInt64, x)
+        OnnxAttrString(x)    => pbcodec.text_len(4, x)
+        OnnxAttrTensor(t)    => pbcodec.nested_len(5, tensor_len(t))
+        OnnxAttrGraph(i)     => pbcodec.nested_len(6, graph_len(graph_at(graphs, i), graphs))
+        OnnxAttrFloats(xs)   => empty_or(pbcodec.reals_len(7, PbTypeFloat, xs, true), 7)
+        OnnxAttrInts(xs)     => empty_or(pbcodec.ints_len(8, PbTypeInt64, xs, true), 8)
+        OnnxAttrStrings(xs)  => strings_len(9, xs)
+        OnnxAttrTensors(xs)  => tensors_len(10, xs)
+        OnnxAttrGraphs(is)   => graphs_len(11, graphs, is)
+        OnnxAttrRaw(_, data) => bytes.len(data)
+
+// An empty packed field's length, where an empty list is written as
+// one.
+//
+// BOTH CALL SITES ARE FIELDS 7 AND 8, whose keys are one byte, so the
+// answer is always 2 — and what a caller depends on is the field
+// NUMBER, not this length: an empty `INTS` and an empty `FLOATS` are
+// byte-identical except for it, which is exactly why an empty list is
+// written as a present-but-empty field rather than as no field at all.
+// A change to this body that still answers 2 is therefore invisible to
+// every test, and the assertion that carries the case is the round trip
+// that reads the empty list back as the kind it was.
+fn empty_or(n: Int, field: Int) -> Int
+    if n == 0
+        return pbwrite.delimited_field_len(field, 0)
+    n
+
+fn strings_len(field: Int, xs: [Str]) -> Int
+    var n = 0
+    for s in xs
+        n = n + pbwrite.delimited_field_len(field, str.len(s))
+    n
+
+fn tensors_len(field: Int, xs: [OnnxTensor]) -> Int
+    var n = 0
+    for t in xs
+        n = n + pbcodec.nested_len(field, tensor_len(t))
+    n
+
+fn graphs_len(field: Int, graphs: [OnnxGraph], indices: [Int]) -> Int
+    var n = 0
+    for i in indices
+        n = n + pbcodec.nested_len(field, graph_len(graph_at(graphs, i), graphs))
+    n
+
+fn write_value(v: OnnxAttrValue, graphs: [OnnxGraph], var dst: Cursor) -> Result<Unit, OnnxFault>
+    match v
+        OnnxAttrFloat(x)     =>
+            let _ = wrote(pbcodec.write_real(2, PbTypeFloat, x, var dst))!
+        OnnxAttrInt(x)       =>
+            let _ = wrote(pbcodec.write_int(3, PbTypeInt64, x, var dst))!
+        OnnxAttrString(x)    =>
+            let _ = wrote(pbwrite.write_string_field(4, x, var dst))!
+        OnnxAttrTensor(t)    =>
+            let body = write_tensor(t)!
+            write_nested(5, body, var dst)!
+        OnnxAttrGraph(i)     =>
+            let body = write_graph(graph_at(graphs, i), graphs)!
+            write_nested(6, body, var dst)!
+        OnnxAttrFloats(xs)   =>
+            write_floats(7, xs, var dst)!
+        OnnxAttrInts(xs)     =>
+            write_ints_field(8, xs, var dst)!
+        OnnxAttrStrings(xs)  =>
+            for s in xs
+                let _ = wrote(pbwrite.write_bytes_field(9, bytes.from_str(s), var dst))!
+        OnnxAttrTensors(xs)  =>
+            for t in xs
+                let body = write_tensor(t)!
+                write_nested(10, body, var dst)!
+        OnnxAttrGraphs(is)   =>
+            for i in is
+                let body = write_graph(graph_at(graphs, i), graphs)!
+                write_nested(11, body, var dst)!
+        OnnxAttrRaw(_, data) =>
+            dst.put_bytes(data)
+    Ok(())
+
+fn write_floats(field: Int, xs: [Float], var dst: Cursor) -> Result<Unit, OnnxFault>
+    if list.len(xs) == 0
+        let _ = wrote(pbwrite.write_bytes_field(field, bytes.zeros(0), var dst))!
+        return Ok(())
+    let _ = wrote(pbcodec.write_reals(field, PbTypeFloat, xs, true, var dst))!
+    Ok(())
+
+fn write_ints_field(field: Int, xs: [Int], var dst: Cursor) -> Result<Unit, OnnxFault>
+    if list.len(xs) == 0
+        let _ = wrote(pbwrite.write_bytes_field(field, bytes.zeros(0), var dst))!
+        return Ok(())
+    let _ = wrote(pbcodec.write_ints(field, PbTypeInt64, xs, true, var dst))!
+    Ok(())
+
+// A `TensorProto`: the shape as unpacked varints, the data as
+// `raw_data` or as `string_data`, and the location when the data is
+// not in this message at all.
+//
+// `dims` IS WRITTEN UNPACKED because `onnx.proto` declares it unpacked
+// — proto2's own default — and a file this package writes should be
+// readable by the oldest parser that meets it.
+fn tensor_len(t: OnnxTensor) -> Int
+    var n = pbcodec.ints_len(1, PbTypeInt64, t.dims, false)
+    n = n + pbcodec.int_len(2, PbTypeInt32, onnxtype.type_code(t.data_type))
+    for s in t.strings
+        n = n + pbwrite.delimited_field_len(6, str.len(s))
+    if str.len(t.name) > 0
+        n = n + pbcodec.text_len(8, t.name)
+    if bytes.len(t.raw) > 0
+        n = n + pbcodec.octets_len(9, t.raw)
+    if onnxtype.is_external(t)
+        n = n + pbcodec.nested_len(13, external_entry_len(t.external_location))
+        n = n + pbcodec.int_len(14, PbTypeInt32, 1)
+    n
+
+fn write_tensor(t: OnnxTensor) -> Result<Bytes, OnnxFault>
+    let size = tensor_len(t)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    let _ = wrote(pbcodec.write_ints(1, PbTypeInt64, t.dims, false, var dst))!
+    let _ = wrote(pbcodec.write_int(2, PbTypeInt32, onnxtype.type_code(t.data_type), var dst))!
+    for s in t.strings
+        let _ = wrote(pbwrite.write_bytes_field(6, bytes.from_str(s), var dst))!
+    if str.len(t.name) > 0
+        let _ = wrote(pbwrite.write_string_field(8, t.name, var dst))!
+    if bytes.len(t.raw) > 0
+        let _ = wrote(pbwrite.write_bytes_field(9, t.raw, var dst))!
+    if onnxtype.is_external(t)
+        let body = external_entry(t.external_location)!
+        write_nested(13, body, var dst)!
+        let _ = wrote(pbcodec.write_int(14, PbTypeInt32, 1, var dst))!
+    if dst.pos() != size
+        // cov: skip — the length is sized from the same fields, in the same order, that this body writes; a disagreement is a defect in the pair and not a state a caller reaches (write_tensor)
+        core.panic.panic("onnxio.write_tensor: the sized and the written lengths disagree")
+    Ok(dst.finish())
+
+fn external_entry_len(location: Str) -> Int
+    pbcodec.text_len(1, "location") + pbcodec.text_len(2, location)
+
+fn external_entry(location: Str) -> Result<Bytes, OnnxFault>
+    let size = external_entry_len(location)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    let _ = wrote(pbwrite.write_string_field(1, "location", var dst))!
+    let _ = wrote(pbwrite.write_string_field(2, location, var dst))!
+    Ok(dst.finish())
+
+// A `ValueInfoProto`, with its type always written: a shape field that
+// is present and empty is rank zero, and dropping it would turn a
+// scalar into a value of unknown rank.
+fn value_info_len(v: OnnxValueInfo) -> Int
+    var n = 0
+    if str.len(v.name) > 0
+        n = n + pbcodec.text_len(1, v.name)
+    n = n + pbcodec.nested_len(2, type_proto_len(v))
+    if str.len(v.doc) > 0
+        n = n + pbcodec.text_len(3, v.doc)
+    n
+
+fn type_proto_len(v: OnnxValueInfo) -> Int
+    pbcodec.nested_len(1, tensor_type_len(v))
+
+fn tensor_type_len(v: OnnxValueInfo) -> Int
+    pbcodec.int_len(1, PbTypeInt32, onnxtype.type_code(v.elem_type))
+        + pbcodec.nested_len(2, shape_len(v.shape))
+
+fn shape_len(s: OnnxShape) -> Int
+    var n = 0
+    for d in s.dims
+        n = n + pbcodec.nested_len(1, dim_len(d))
+    n
+
+fn dim_len(d: OnnxDim) -> Int
+    match d
+        OnnxDimValue(size) => pbcodec.int_len(1, PbTypeInt64, size)
+        OnnxDimParam(name) => pbcodec.text_len(2, name)
+        OnnxDimUnknown     => 0
+
+fn write_value_info(v: OnnxValueInfo) -> Result<Bytes, OnnxFault>
+    let size = value_info_len(v)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    if str.len(v.name) > 0
+        let _ = wrote(pbwrite.write_string_field(1, v.name, var dst))!
+    let type_body = write_type_proto(v)!
+    write_nested(2, type_body, var dst)!
+    if str.len(v.doc) > 0
+        let _ = wrote(pbwrite.write_string_field(3, v.doc, var dst))!
+    if dst.pos() != size
+        // cov: skip — the length is sized from the same fields, in the same order, that this body writes; a disagreement is a defect in the pair and not a state a caller reaches (write_value_info)
+        core.panic.panic("onnxio.write_value_info: the sized and the written lengths disagree")
+    Ok(dst.finish())
+
+fn write_type_proto(v: OnnxValueInfo) -> Result<Bytes, OnnxFault>
+    let size = type_proto_len(v)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    let tensor_body = write_tensor_type(v)!
+    write_nested(1, tensor_body, var dst)!
+    if dst.pos() != size
+        // cov: skip — the length is sized from the same fields, in the same order, that this body writes; a disagreement is a defect in the pair and not a state a caller reaches (write_type_proto)
+        core.panic.panic("onnxio.write_type_proto: the sized and the written lengths disagree")
+    Ok(dst.finish())
+
+fn write_tensor_type(v: OnnxValueInfo) -> Result<Bytes, OnnxFault>
+    let size = tensor_type_len(v)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    let _ = wrote(pbcodec.write_int(1, PbTypeInt32, onnxtype.type_code(v.elem_type), var dst))!
+    let shape_body = write_shape(v.shape)!
+    write_nested(2, shape_body, var dst)!
+    if dst.pos() != size
+        // cov: skip — the length is sized from the same fields, in the same order, that this body writes; a disagreement is a defect in the pair and not a state a caller reaches (write_tensor_type)
+        core.panic.panic("onnxio.write_tensor_type: the sized and the written lengths disagree")
+    Ok(dst.finish())
+
+fn write_shape(s: OnnxShape) -> Result<Bytes, OnnxFault>
+    let size = shape_len(s)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    for d in s.dims
+        let body = write_dim(d)!
+        write_nested(1, body, var dst)!
+    if dst.pos() != size
+        // cov: skip — the length is sized from the same fields, in the same order, that this body writes; a disagreement is a defect in the pair and not a state a caller reaches (write_shape)
+        core.panic.panic("onnxio.write_shape: the sized and the written lengths disagree")
+    Ok(dst.finish())
+
+fn write_dim(d: OnnxDim) -> Result<Bytes, OnnxFault>
+    let size = dim_len(d)
+    var dst = bytes.cursor_le(bytes.zeros(size))
+    match d
+        OnnxDimValue(n)    =>
+            let _ = wrote(pbcodec.write_int(1, PbTypeInt64, n, var dst))!
+        OnnxDimParam(name) =>
+            let _ = wrote(pbwrite.write_string_field(2, name, var dst))!
+        OnnxDimUnknown     => ()
+    Ok(dst.finish())

@@ -31,6 +31,8 @@
 // `onnxtype.element_count` and `onnxtype.element_bytes` are what it
 // needs to do that.
 
+use onnxfault
+
 // The element type of a tensor: `TensorProto.DataType`.
 //
 // ```novo
@@ -155,8 +157,31 @@ pub struct OnnxValueInfo
 // fn main() [io]
 //     println("${onnxtype.type_code(OnnxInt64)}")   // 7
 // ```
+// `onnx.proto`'s `TensorProto.DataType` keeps growing past the end of
+// this table.  The first seventeen codes — `0` through `16`, through
+// `BFLOAT16` — are the ones modelled here, and every later code is
+// refused as unknown rather than guessed at.  Reading one is a table
+// and not a lookup, because the codes are the file's and the names are
+// the specification's.
 pub fn type_code(t: OnnxDataType) -> Int []
-    todo("onnx-nv.onnxtype.type_code")
+    match t
+        OnnxUndefined  => 0
+        OnnxFloat      => 1
+        OnnxUint8      => 2
+        OnnxInt8       => 3
+        OnnxUint16     => 4
+        OnnxInt16      => 5
+        OnnxInt32      => 6
+        OnnxInt64      => 7
+        OnnxString     => 8
+        OnnxBool       => 9
+        OnnxFloat16    => 10
+        OnnxDouble     => 11
+        OnnxUint32     => 12
+        OnnxUint64     => 13
+        OnnxComplex64  => 14
+        OnnxComplex128 => 15
+        OnnxBfloat16   => 16
 
 // The type a code names, or `OnnxUnknownDataType`.
 //
@@ -165,11 +190,30 @@ pub fn type_code(t: OnnxDataType) -> Int []
 //
 // fn main() [io]
 //     match onnxtype.type_of_code(99)
-//         Ok(_)  => println("this cannot happen — there are seventeen")
+//         Ok(_)  => println("this cannot happen — 99 is past the table")
 //         Err(e) => println(e.message())
 // ```
 pub fn type_of_code(code: Int) -> Result<OnnxDataType, OnnxFault> []
-    todo("onnx-nv.onnxtype.type_of_code")
+    if code < 0 or code > 16
+        return Err(OnnxUnknownDataType(code))
+    match code
+        0  => Ok(OnnxUndefined)
+        1  => Ok(OnnxFloat)
+        2  => Ok(OnnxUint8)
+        3  => Ok(OnnxInt8)
+        4  => Ok(OnnxUint16)
+        5  => Ok(OnnxInt16)
+        6  => Ok(OnnxInt32)
+        7  => Ok(OnnxInt64)
+        8  => Ok(OnnxString)
+        9  => Ok(OnnxBool)
+        10 => Ok(OnnxFloat16)
+        11 => Ok(OnnxDouble)
+        12 => Ok(OnnxUint32)
+        13 => Ok(OnnxUint64)
+        14 => Ok(OnnxComplex64)
+        15 => Ok(OnnxComplex128)
+        _  => Ok(OnnxBfloat16)
 
 // The type's name as `onnx.proto` spells it: `"FLOAT"`, `"INT64"`,
 // `"BFLOAT16"`.
@@ -181,7 +225,24 @@ pub fn type_of_code(code: Int) -> Result<OnnxDataType, OnnxFault> []
 //     println(onnxtype.type_name(OnnxBfloat16))   // BFLOAT16
 // ```
 pub fn type_name(t: OnnxDataType) -> Str []
-    todo("onnx-nv.onnxtype.type_name")
+    match t
+        OnnxUndefined  => "UNDEFINED"
+        OnnxFloat      => "FLOAT"
+        OnnxUint8      => "UINT8"
+        OnnxInt8       => "INT8"
+        OnnxUint16     => "UINT16"
+        OnnxInt16      => "INT16"
+        OnnxInt32      => "INT32"
+        OnnxInt64      => "INT64"
+        OnnxString     => "STRING"
+        OnnxBool       => "BOOL"
+        OnnxFloat16    => "FLOAT16"
+        OnnxDouble     => "DOUBLE"
+        OnnxUint32     => "UINT32"
+        OnnxUint64     => "UINT64"
+        OnnxComplex64  => "COMPLEX64"
+        OnnxComplex128 => "COMPLEX128"
+        OnnxBfloat16   => "BFLOAT16"
 
 // How many bytes one element takes, or `0` for `OnnxString` and
 // `OnnxUndefined`, neither of which has a fixed width.
@@ -194,7 +255,24 @@ pub fn type_name(t: OnnxDataType) -> Str []
 //     println("${onnxtype.element_bytes(OnnxString)}")    // 0
 // ```
 pub fn element_bytes(t: OnnxDataType) -> Int []
-    todo("onnx-nv.onnxtype.element_bytes")
+    match t
+        OnnxUndefined  => 0
+        OnnxFloat      => 4
+        OnnxUint8      => 1
+        OnnxInt8       => 1
+        OnnxUint16     => 2
+        OnnxInt16      => 2
+        OnnxInt32      => 4
+        OnnxInt64      => 8
+        OnnxString     => 0
+        OnnxBool       => 1
+        OnnxFloat16    => 2
+        OnnxDouble     => 8
+        OnnxUint32     => 4
+        OnnxUint64     => 8
+        OnnxComplex64  => 8
+        OnnxComplex128 => 16
+        OnnxBfloat16   => 2
 
 // Whether the type is floating point: the two complex types included,
 // because their components are.
@@ -207,7 +285,14 @@ pub fn element_bytes(t: OnnxDataType) -> Int []
 //     println("${onnxtype.is_float(OnnxInt64)}")      // false
 // ```
 pub fn is_float(t: OnnxDataType) -> Bool []
-    todo("onnx-nv.onnxtype.is_float")
+    match t
+        OnnxFloat      => true
+        OnnxFloat16    => true
+        OnnxDouble     => true
+        OnnxBfloat16   => true
+        OnnxComplex64  => true
+        OnnxComplex128 => true
+        _              => false
 
 // A shape from its dimensions.
 //
@@ -218,7 +303,17 @@ pub fn is_float(t: OnnxDataType) -> Bool []
 //     println("${onnxtype.rank(onnxtype.shape([OnnxDimValue(1)]))}")   // 1
 // ```
 pub fn shape(dims: [OnnxDim]) -> OnnxShape []
-    todo("onnx-nv.onnxtype.shape")
+    OnnxShape { dims: dims }
+
+// The product of a list of dimensions, which is `1` for the empty list
+// because a rank-zero tensor holds one element.  Zero appears in a
+// shape's own terms — an empty batch is `0 x 3` — and multiplies out
+// the way it should.
+fn product_of(dims: [Int]) -> Int
+    var n = 1
+    for d in dims
+        n = n * d
+    n
 
 // A shape whose every dimension is a fixed number.
 //
@@ -229,7 +324,10 @@ pub fn shape(dims: [OnnxDim]) -> OnnxShape []
 //     println("${onnxtype.is_fully_known(onnxtype.fixed_shape([1, 3, 224, 224]))}")
 // ```
 pub fn fixed_shape(dims: [Int]) -> OnnxShape []
-    todo("onnx-nv.onnxtype.fixed_shape")
+    var out: [OnnxDim] = []
+    for d in dims
+        list.push(out, OnnxDimValue(d))
+    OnnxShape { dims: out }
 
 // How many dimensions the shape has.
 //
@@ -240,7 +338,7 @@ pub fn fixed_shape(dims: [Int]) -> OnnxShape []
 //     println("${onnxtype.rank(onnxtype.fixed_shape([1, 3, 224, 224]))}")   // 4
 // ```
 pub fn rank(s: OnnxShape) -> Int []
-    todo("onnx-nv.onnxtype.rank")
+    list.len(s.dims)
 
 // A dimension as text: its number, its name, or `"?"`.
 //
@@ -255,7 +353,10 @@ pub fn rank(s: OnnxShape) -> Int []
 //     println(onnxtype.dim_text(OnnxDimUnknown))      // ?
 // ```
 pub fn dim_text(d: OnnxDim) -> Str []
-    todo("onnx-nv.onnxtype.dim_text")
+    match d
+        OnnxDimValue(size) => "${size}"
+        OnnxDimParam(name) => name
+        OnnxDimUnknown     => "?"
 
 // The shape as text: `"batch x 3 x 224 x 224"`.
 //
@@ -267,7 +368,10 @@ pub fn dim_text(d: OnnxDim) -> Str []
 //                                                 OnnxDimValue(3)])))
 // ```
 pub fn shape_text(s: OnnxShape) -> Str []
-    todo("onnx-nv.onnxtype.shape_text")
+    var parts: [Str] = []
+    for d in s.dims
+        list.push(parts, dim_text(d))
+    str.join(parts, " x ")
 
 // Whether every dimension is a fixed number.
 //
@@ -280,7 +384,12 @@ pub fn shape_text(s: OnnxShape) -> Str []
 //     println("${onnxtype.is_fully_known(onnxtype.shape([OnnxDimParam("batch")]))}")
 // ```
 pub fn is_fully_known(s: OnnxShape) -> Bool []
-    todo("onnx-nv.onnxtype.is_fully_known")
+    for d in s.dims
+        match d
+            OnnxDimValue(_) => ()
+            _               =>
+                return false
+    true
 
 // How many elements the shape holds, or `None` when any dimension is
 // symbolic or unknown.
@@ -298,7 +407,14 @@ pub fn is_fully_known(s: OnnxShape) -> Bool []
 //         None    => println("not fully known")
 // ```
 pub fn element_count(s: OnnxShape) -> ?Int []
-    todo("onnx-nv.onnxtype.element_count")
+    var n = 1
+    for d in s.dims
+        match d
+            OnnxDimValue(size) =>
+                n = n * size
+            _                  =>
+                return None
+    Some(n)
 
 // Every symbolic dimension name in the shape, in order, without
 // repeats.
@@ -316,7 +432,14 @@ pub fn element_count(s: OnnxShape) -> ?Int []
 //     println("${list.len(onnxtype.symbols_of(s))}")   // 1
 // ```
 pub fn symbols_of(s: OnnxShape) -> [Str] []
-    todo("onnx-nv.onnxtype.symbols_of")
+    var out: [Str] = []
+    for d in s.dims
+        match d
+            OnnxDimParam(name) =>
+                if not list.contains(out, name)
+                    list.push(out, name)
+            _                  => ()
+    out
 
 // The shape with every occurrence of a named dimension replaced by a
 // number.
@@ -331,7 +454,16 @@ pub fn symbols_of(s: OnnxShape) -> [Str] []
 //     println("${onnxtype.is_fully_known(onnxtype.bind_symbol(s, "batch", 8))}")
 // ```
 pub fn bind_symbol(s: OnnxShape, name: Str, size: Int) -> OnnxShape []
-    todo("onnx-nv.onnxtype.bind_symbol")
+    var out: [OnnxDim] = []
+    for d in s.dims
+        match d
+            OnnxDimParam(symbol) =>
+                if symbol == name
+                    list.push(out, OnnxDimValue(size))
+                else
+                    list.push(out, d)
+            _                    => list.push(out, d)
+    OnnxShape { dims: out }
 
 // A tensor from its parts.
 //
@@ -344,7 +476,8 @@ pub fn bind_symbol(s: OnnxShape, name: Str, size: Int) -> OnnxShape []
 //     println("${t.name}")                      // W
 // ```
 pub fn tensor(name: Str, data_type: OnnxDataType, dims: [Int], raw: Bytes) -> OnnxTensor []
-    todo("onnx-nv.onnxtype.tensor")
+    OnnxTensor { name: name, data_type: data_type, dims: dims, raw: raw,
+                 strings: [], external_location: "" }
 
 // How many elements the tensor holds, from its dimensions.
 //
@@ -357,7 +490,7 @@ pub fn tensor(name: Str, data_type: OnnxDataType, dims: [Int], raw: Bytes) -> On
 //     println("${onnxtype.tensor_element_count(t)}")   // 6
 // ```
 pub fn tensor_element_count(t: OnnxTensor) -> Int []
-    todo("onnx-nv.onnxtype.tensor_element_count")
+    product_of(t.dims)
 
 // How many bytes the tensor's data should occupy: elements times
 // element width.
@@ -374,7 +507,7 @@ pub fn tensor_element_count(t: OnnxTensor) -> Int []
 //     println("${onnxtype.tensor_byte_length(t)}")   // 24
 // ```
 pub fn tensor_byte_length(t: OnnxTensor) -> Int []
-    todo("onnx-nv.onnxtype.tensor_byte_length")
+    tensor_element_count(t) * element_bytes(t.data_type)
 
 // Whether the tensor's data lives in a separate file.
 //
@@ -391,7 +524,7 @@ pub fn tensor_byte_length(t: OnnxTensor) -> Int []
 //     println("${onnxtype.is_external(t)}")     // false
 // ```
 pub fn is_external(t: OnnxTensor) -> Bool []
-    todo("onnx-nv.onnxtype.is_external")
+    str.len(t.external_location) > 0
 
 // A value info from its parts.
 //
@@ -404,4 +537,4 @@ pub fn is_external(t: OnnxTensor) -> Bool []
 //     println(v.name)                           // x
 // ```
 pub fn value_info(name: Str, elem_type: OnnxDataType, shape: OnnxShape) -> OnnxValueInfo []
-    todo("onnx-nv.onnxtype.value_info")
+    OnnxValueInfo { name: name, elem_type: elem_type, shape: shape, doc: "" }

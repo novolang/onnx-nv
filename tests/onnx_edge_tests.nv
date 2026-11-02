@@ -1,0 +1,2008 @@
+// onnx_edge_tests.nv — the seams `tests/`'s four files leave open.
+//
+// WHAT THIS FILE PINS, AND WHY EACH ONE IS A DECISION
+//
+// The four files beside this one pin the interface of `onnx.proto`:
+// the model, the graph, the attributes, the type table and the operator
+// table.  This file pins the five places where a reader has to choose
+// something the interface does not say, because each of them is a place
+// where a plausible implementation is wrong in a way that compiles and
+// runs:
+//
+//   - ORDER.  ONNX's repeated fields are positional and its node list is
+//     a program.  A reader that sorted, deduplicated or topologically
+//     reordered them answers a different model.
+//   - DIMENSIONS.  A dimension is an OPTIONAL integer: absent is not
+//     zero, and a shape with no dimensions is a scalar and not a shape
+//     nobody wrote down.
+//   - THE WIDTH OF A TENSOR'S NUMBERS comes from the tensor's element
+//     type and not from the field they arrived in, and a length that
+//     disagrees with the shape is a malformed file and not a short read.
+//   - WHAT A NODE CONSUMES.  `onnxio.read` does not validate the graph
+//     (it cannot — the file is read before anything is known about it)
+//     and `onnxcheck` reports a name nothing produces.
+//   - THE DATA THAT IS NOT IN THE FILE.  An external tensor is refused,
+//     named, and supplied by the caller; a model too large to be one
+//     message becomes one.
+
+use std.test
+use std.list
+use std.bytes
+use onnxfault
+use onnxattr
+use onnxcheck
+use onnxgraph
+use onnxio
+use onnxopset
+use onnxtype
+
+// ── Hand-built protobuf files ───────────────────────────────────────
+//
+// A file this package's writer would never produce — one that holds its
+// numbers in `int32_data`, or an attribute field the package does not
+// model — cannot be made by writing a model.  These four helpers
+// assemble one from a script's worth of bytes, which is the only way to
+// reach the reading half of those fields.
+
+// One protobuf varint.
+fn varint(n0: Int) -> Bytes
+    var out = bytes.zeros(0)
+    var n = n0
+    while n >= 128
+        out = out + bytes.from_byte_list([n % 128 + 128])
+        n = n / 128
+    out + bytes.from_byte_list([n])
+
+// A field's key: its number and its wire type.
+fn key(field: Int, wire: Int) -> Bytes
+    varint(field * 8 + wire)
+
+// A length-delimited field.
+fn ld(field: Int, body: Bytes) -> Bytes
+    key(field, 2) + varint(bytes.len(body)) + body
+
+// A length-delimited field whose body is a string.
+fn sf(field: Int, text: Str) -> Bytes
+    ld(field, bytes.from_str(text))
+
+// A varint field.
+fn vf(field: Int, value: Int) -> Bytes
+    key(field, 0) + varint(value)
+
+// A model whose one graph holds one initializer.
+fn model_with_initializer(tensor: Bytes) -> Bytes
+    vf(1, 10) + ld(7, ld(5, tensor))
+
+// A model whose one graph holds one node.
+fn model_with_node(node: Bytes) -> Bytes
+    vf(1, 10) + ld(7, ld(1, node))
+
+// ── Fixtures ────────────────────────────────────────────────────────
+
+// The model a graph and an opset import make.  `producer_name` is set
+// so that a checker's note about a nameless producer never appears in a
+// fixture that is about something else.
+fn model_of(g: OnnxGraph) -> OnnxModel []
+    model_with_graphs(10, [onnxgraph.opset_import("", 17)], [g])
+
+// The model any IR version, any imports and any list of graphs make.
+// The main graph is index 0 and every subgraph follows it, which is the
+// layout the package documents — and the layout a hand-built model has
+// to use to reach the subgraph half of the checker.
+fn model_with_graphs(ir: Int, imports: [OnnxOpsetImport], graphs: [OnnxGraph]) -> OnnxModel []
+    OnnxModel { ir_version: ir, opset_import: imports, producer_name: "onnx-nv tests",
+                producer_version: "0.1.0", domain: "", model_version: 1, doc: "",
+                main: 0, graphs: graphs, unknown: onnxgraph.empty_model().unknown }
+
+// The graph a node list and nothing else makes.
+fn graph_of(nodes: [OnnxNode]) -> OnnxGraph []
+    OnnxGraph { name: "g", node: nodes, input: [], output: [], value_info: [],
+                initializer: [], doc: "" }
+
+// The findings for the model a list of nodes makes.
+fn findings_of(nodes: [OnnxNode]) -> [OnnxFinding] []
+    onnxcheck.check(model_of(graph_of(nodes)))
+
+// The model a graph with no nodes and one initializer makes.
+fn model_with(t: OnnxTensor) -> OnnxModel []
+    model_of(OnnxGraph { name: "g", node: [], input: [], output: [], value_info: [],
+                         initializer: [t], doc: "" })
+
+// ── What every test here would rather panic than assert ─────────────
+//
+// A round trip of a model this package wrote, and a read of a file it
+// wrote, are the floor of every test in this file and not the claim
+// under test: a refusal there is a defect in the fixture or in the
+// package, and the panic says which operation it was.
+
+// The bytes a write produced.
+fn written(m: OnnxModel) -> Bytes [io]
+    match onnxio.write(m)
+        Ok(b)  => b
+        Err(_) =>
+            core.panic.panic("onnx_edge_tests: the writer refused a model it should write")
+
+// The model a read of a well-formed file answered.
+fn read_ok(src: Bytes) -> OnnxModel [io]
+    match onnxio.read(src, onnxio.default_limits())
+        Ok(back) => back
+        Err(_)   =>
+            core.panic.panic("onnx_edge_tests: the reader refused a file the writer made")
+
+// The header of a well-formed file.
+fn header_of(src: Bytes) -> OnnxModel [io]
+    match onnxio.read_header(src)
+        Ok(h)  => h
+        Err(_) =>
+            core.panic.panic("onnx_edge_tests: the header read refused a file the writer made")
+
+// The pair externalize answered.
+fn externalized(m: OnnxModel, location: Str, threshold: Int) -> (OnnxModel, Bytes) [io]
+    match onnxio.externalize(m, location, threshold)
+        Ok(p)  => p
+        Err(_) =>
+            core.panic.panic("onnx_edge_tests: externalize refused a model it should move")
+
+fn read_code(src: Bytes) -> Str [io]
+    match onnxio.read(src, onnxio.default_limits())
+        Ok(_)  => "ok"
+        Err(e) => onnxfault.code(e)
+
+// The length a model's encoding will have.
+fn sized(m: OnnxModel) -> Int [io]
+    match onnxio.encoded_len(m)
+        Ok(n)  => n
+        Err(_) =>
+            core.panic.panic("onnx_edge_tests: encoded_len refused a model it should size")
+
+// A write-then-read round trip, at the ordinary limits.
+fn round_trip(m: OnnxModel) -> OnnxModel [io]
+    read_ok(written(m))
+
+// Whether any finding carries a code.
+fn any_code(findings: [OnnxFinding], code: Str) -> Bool []
+    for f in findings
+        if f.code == code
+            return true
+    false
+
+// ── The order of a repeated field is the file's order ───────────────
+
+@test
+fn test_the_order_of_a_repeated_field_is_the_files_order() [io]
+    // ONNX's node list IS the program, and its initializer list is
+    // positional.  A reader that sorted either one — or that
+    // deduplicated the names — would hand back a model that compiles
+    // and computes something else, which is the worst kind of wrong
+    // because nothing refuses it.
+    let g = OnnxGraph { name: "g",
+        node: [onnxgraph.node("c", "Relu", ["t"], ["u"]),
+               onnxgraph.node("a", "Relu", ["u"], ["v"]),
+               onnxgraph.node("b", "Relu", ["v", "", "w"], ["w"])],
+        input: [], output: [], value_info: [],
+        initializer: [onnxtype.tensor("zz", OnnxFloat, [1], bytes.zeros(4)),
+                      onnxtype.tensor("aa", OnnxFloat, [1], bytes.zeros(4))],
+        doc: "" }
+    let back = round_trip(model_of(g))
+    let gb = onnxgraph.main_graph(back)
+
+    test.case("the nodes come back in the order the file held them")
+    test.assert_eq(list.len(gb.node), 3)
+    let n0 = list.get(gb.node, 0)
+    let n1 = list.get(gb.node, 1)
+    let n2 = list.get(gb.node, 2)
+    test.assert_eq_str(n0.name, "c")
+    test.assert_eq_str(n1.name, "a")
+    test.assert_eq_str(n2.name, "b")
+
+    test.case("a node's inputs are positional, so an empty one keeps its place")
+    test.assert_eq(list.len(n2.input), 3)
+    test.assert_eq_str(list.get(n2.input, 0), "v")
+    test.assert_eq_str(list.get(n2.input, 1), "")
+    test.assert_eq_str(list.get(n2.input, 2), "w")
+
+    test.case("and the initializers come back in the order the file held them")
+    test.assert_eq(list.len(gb.initializer), 2)
+    test.assert_eq_str(list.get(gb.initializer, 0).name, "zz")
+    test.assert_eq_str(list.get(gb.initializer, 1).name, "aa")
+
+@test
+fn test_a_round_trip_does_not_topologically_sort_the_nodes() [io]
+    // The strongest form of the claim above: `b` consumes what `a`
+    // produces and is written FIRST.  A reader that put the list into
+    // topological order would answer a sorted graph, and `is_sorted`
+    // would then be true for a model whose file said otherwise.
+    let g = OnnxGraph { name: "g",
+        node: [onnxgraph.node("b", "Relu", ["y"], ["z"]),
+               onnxgraph.node("a", "Relu", ["x"], ["y"])],
+        input: [onnxtype.value_info("x", OnnxFloat, onnxtype.fixed_shape([1]))],
+        output: [onnxtype.value_info("z", OnnxFloat, onnxtype.fixed_shape([1]))],
+        value_info: [], initializer: [], doc: "" }
+    test.assert(not onnxgraph.is_sorted(g))
+
+    let back = round_trip(model_of(g))
+    let gb = onnxgraph.main_graph(back)
+    test.assert(not onnxgraph.is_sorted(gb))
+    let first = list.get(gb.node, 0)
+    test.assert_eq_str(first.name, "b")
+
+@test
+fn test_a_cycle_in_the_node_list_is_refused_by_the_walk() [io]
+    // A graph is a directed graph and a node's input may come from an
+    // initializer, a graph input, or an EARLIER node.  A cycle is the
+    // one shape no ordering answers, and the walk says so instead of
+    // looping.
+    let g = OnnxGraph { name: "g",
+        node: [onnxgraph.node("p", "Relu", ["q"], ["r"]),
+               onnxgraph.node("q", "Relu", ["r"], ["q"])],
+        input: [], output: [], value_info: [], initializer: [], doc: "" }
+    match onnxgraph.topological_order(g)
+        Ok(_)  =>
+            test.fail("neither node may run first")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "graph_has_cycle")
+
+    test.case("a node that consumes its own output is a cycle of one")
+    // The shortest cycle there is, and the one a "is every input
+    // produced by an EARLIER node" test gets wrong by a single
+    // character: `>=` is the rule, because a name a node produces for
+    // itself is not available to it.
+    let self_loop = OnnxGraph { name: "g",
+        node: [onnxgraph.node("s", "Relu", ["r"], ["r"])],
+        input: [], output: [], value_info: [], initializer: [], doc: "" }
+    test.assert(not onnxgraph.is_sorted(self_loop))
+    match onnxgraph.topological_order(self_loop)
+        Ok(_)  =>
+            test.fail("a node that needs its own answer can never run")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "graph_has_cycle")
+
+    test.case("and the refusal names the node the cycle starts at, not the first")
+    // A graph whose first node is fine and whose second and third
+    // depend on each other: the refusal has to reach past the node it
+    // has already placed, and the index and the name have to agree —
+    // a reader told "node 0" would look at the wrong node.
+    let later = OnnxGraph { name: "g",
+        node: [onnxgraph.node("ok", "Relu", ["x"], ["a"]),
+               onnxgraph.node("cyc1", "Relu", ["b"], ["c"]),
+               onnxgraph.node("cyc2", "Relu", ["c"], ["b"])],
+        input: [], output: [], value_info: [],
+        initializer: [], doc: "" }
+    match onnxgraph.topological_order(later)
+        Ok(_)  => test.fail("cyc1 and cyc2 cannot both run")
+        Err(e) =>
+            test.assert_eq_str(e.message(), "node 1 ('cyc1') closes a cycle in the graph")
+
+// ── A dimension is an optional integer ──────────────────────────────
+
+@test
+fn test_a_symbolic_dimension_and_a_scalar_are_both_not_a_number() [io]
+    // `Dimension` has two optional fields and a reader that folds them
+    // into one integer gets both of these wrong, in opposite
+    // directions: a symbolic dimension becomes 0, and a rank-zero
+    // scalar becomes a shape nobody wrote down.
+    let g = OnnxGraph { name: "g", node: [],
+        input: [onnxtype.value_info("x", OnnxFloat,
+                    onnxtype.shape([OnnxDimParam("batch"), OnnxDimValue(3)])),
+                onnxtype.value_info("s", OnnxFloat, onnxtype.shape([])),
+                onnxtype.value_info("u", OnnxFloat, onnxtype.shape([OnnxDimUnknown]))],
+        output: [], value_info: [], initializer: [], doc: "" }
+    let back = round_trip(model_of(g))
+    let gb = onnxgraph.main_graph(back)
+    test.assert_eq(list.len(gb.input), 3)
+
+    test.case("a named dimension keeps its name and its place")
+    let x = list.get(gb.input, 0)
+    test.assert_eq(onnxtype.rank(x.shape), 2)
+    test.assert_eq_str(onnxtype.dim_text(list.get(x.shape.dims, 0)), "batch")
+    test.assert_eq_str(onnxtype.dim_text(list.get(x.shape.dims, 1)), "3")
+    test.assert(not onnxtype.is_fully_known(x.shape))
+
+    test.case("a rank-zero shape is a scalar, which is fully known")
+    let s = list.get(gb.input, 1)
+    test.assert_eq(onnxtype.rank(s.shape), 0)
+    test.assert_eq(list.len(s.shape.dims), 0)
+    test.assert(onnxtype.is_fully_known(s.shape))
+
+    test.case("and a dimension that is neither a number nor a name is not zero")
+    let u = list.get(gb.input, 2)
+    test.assert_eq(onnxtype.rank(u.shape), 1)
+    test.assert_eq_str(onnxtype.dim_text(list.get(u.shape.dims, 0)), "?")
+
+// ── The width of a tensor's numbers is its element type's ────────────
+
+@test
+fn test_the_element_type_decides_the_width_of_the_numbers() [io]
+    // `int32_data` is the field for INT32, INT16, INT8, UINT8, BOOL and
+    // FLOAT16 alike — `onnx.proto` says a float16 is put there
+    // "converted bit-wise to unsigned".  A reader that widened every
+    // element of it to thirty-two bits would answer four times the
+    // bytes for every quantized model in the world, and the size check
+    // would then refuse them all as malformed.
+    test.case("four INT8 elements are four bytes, in the file's order")
+    let int8 = vf(1, 4) + vf(2, 3) + ld(5, bytes.from_byte_list([1, 2, 3, 4]))
+    let m = read_ok(model_with_initializer(int8))
+    let t = list.get(onnxgraph.main_graph(m).initializer, 0)
+    test.assert(t.data_type == OnnxInt8)
+    test.assert_eq(list.len(t.dims), 1)
+    test.assert_eq(list.get(t.dims, 0), 4)
+    test.assert_eq_str(bytes.to_hex(t.raw), "01020304")
+
+    test.case("the same numbers as UINT16 are little-endian two-byte elements")
+    // 1 and 258: the second is 0x0102, and its bytes go low first.
+    let int16 = vf(1, 2) + vf(2, 4) + ld(5, bytes.from_byte_list([1, 0x82, 0x02]))
+    let m2 = read_ok(model_with_initializer(int16))
+    let t2 = list.get(onnxgraph.main_graph(m2).initializer, 0)
+    test.assert(t2.data_type == OnnxUint16)
+    test.assert_eq_str(bytes.to_hex(t2.raw), "01000201")
+
+    test.case("an INT64 tensor's values are eight bytes each, low byte first")
+    // 258, in `int64_data`, which is where onnx.proto puts an INT64
+    // tensor's numbers.
+    let int64 = vf(1, 1) + vf(2, 7) + ld(7, bytes.from_byte_list([0x82, 0x02]))
+    let m3 = read_ok(model_with_initializer(int64))
+    let t3 = list.get(onnxgraph.main_graph(m3).initializer, 0)
+    test.assert(t3.data_type == OnnxInt64)
+    test.assert_eq(bytes.len(t3.raw), 8)
+    test.assert_eq_str(bytes.to_hex(t3.raw), "0201000000000000")
+
+    test.case("and a value in int32_data is widened to the element type's width")
+    // `int32_data` holds INTEGERS, not thirty-two-bit words: the
+    // element type decides how many bytes each one takes, exactly as
+    // it does for `raw_data`.  Only a hand-built file spells an INT64
+    // tensor this way, and the four values here are thirty-two bytes of
+    // tensor and not sixteen — which is what the shape's four elements
+    // imply, so the size check passes.
+    let widened = vf(1, 4) + vf(2, 7) + ld(8, bytes.from_byte_list([0x57]))
+        + ld(5, bytes.from_byte_list([1, 2, 3, 4]))
+    let m4 = read_ok(model_with_initializer(widened))
+    let t4 = list.get(onnxgraph.main_graph(m4).initializer, 0)
+    test.assert_eq_str(t4.name, "W")
+    test.assert_eq(bytes.len(t4.raw), 32)
+    test.assert_eq_str(bytes.to_hex(t4.raw),
+        "0100000000000000020000000000000003000000000000000400000000000000")
+
+    test.case("and an int32_data field on a type with no byte width writes nothing")
+    // STRING has no fixed width, so the numbers have nowhere to go and
+    // the tensor's bytes stay empty rather than being guessed.
+    let stringy = vf(1, 2) + vf(2, 8) + ld(8, bytes.from_byte_list([0x57]))
+        + ld(5, bytes.from_byte_list([1, 2]))
+    let m5 = read_ok(model_with_initializer(stringy))
+    let t5 = list.get(onnxgraph.main_graph(m5).initializer, 0)
+    test.assert_eq(bytes.len(t5.raw), 0)
+
+@test
+fn test_a_tensor_written_as_reals_is_read_at_the_element_types_width() [io]
+    // `float_data` and `double_data` are the two fields for a model
+    // whose weights were written as numbers rather than as a byte
+    // image, and onnx.proto declares them PACKED.  The element type
+    // still decides the width, and the bytes are still little-endian;
+    // a reader that assumed one width for both fields would answer
+    // half a tensor for one of them, or twice as much as it has.
+    test.case("two float32 elements out of float_data")
+    // 1.0 is 0x3F800000 and 2.0 is 0x40000000.
+    let f = vf(1, 2) + vf(2, 1) + ld(4, bytes.from_byte_list(
+        [0, 0, 0x80, 0x3F, 0, 0, 0, 0x40]))
+    let one = read_ok(model_with_initializer(f))
+    let t1 = list.get(onnxgraph.main_graph(one).initializer, 0)
+    test.assert(t1.data_type == OnnxFloat)
+    test.assert_eq_str(bytes.to_hex(t1.raw), "0000803f00000040")
+
+    test.case("and one double out of double_data")
+    // 1.5 is 0x3FF8000000000000.
+    let d = vf(1, 1) + vf(2, 11) + ld(10, bytes.from_byte_list(
+        [0, 0, 0, 0, 0, 0, 0xF8, 0x3F]))
+    let two = read_ok(model_with_initializer(d))
+    let t2 = list.get(onnxgraph.main_graph(two).initializer, 0)
+    test.assert(t2.data_type == OnnxDouble)
+    test.assert_eq_str(bytes.to_hex(t2.raw), "000000000000f83f")
+
+@test
+fn test_a_packed_and_an_unpacked_repeated_field_are_both_read() [io]
+    // `onnx.proto` declares `dims` unpacked and `int32_data` packed,
+    // and every conforming parser must accept either for either.  A
+    // reader that took only the declared spelling would refuse files
+    // written by a conforming encoder — the difference is invisible in
+    // the file's meaning and total in whether it loads.
+    test.case("dims arrive packed, which is not what this package writes")
+    let packed = ld(1, bytes.from_byte_list([2])) + vf(2, 3)
+        + ld(5, bytes.from_byte_list([7, 8]))
+    let one = read_ok(model_with_initializer(packed))
+    let t1 = list.get(onnxgraph.main_graph(one).initializer, 0)
+    test.assert_eq(list.get(t1.dims, 0), 2)
+    test.assert_eq_str(bytes.to_hex(t1.raw), "0708")
+
+    test.case("and unpacked, which is what this package writes")
+    let unpacked = vf(1, 2) + vf(2, 3) + ld(5, bytes.from_byte_list([7, 8]))
+    let two = read_ok(model_with_initializer(unpacked))
+    let t2 = list.get(onnxgraph.main_graph(two).initializer, 0)
+    test.assert_eq(list.get(t2.dims, 0), 2)
+    test.assert_eq_str(bytes.to_hex(t2.raw), "0708")
+
+@test
+fn test_raw_data_that_disagrees_with_the_shape_is_refused() [io]
+    // The length of `raw_data` is the product of the dimensions times
+    // the element width.  Reading the first N bytes of a tensor that
+    // says it holds more is how a model comes back holding garbage that
+    // a runtime will happily compute with, so the mismatch is a refusal
+    // and not a truncated read.
+    let g = OnnxGraph { name: "g", node: [], input: [], output: [], value_info: [],
+        initializer: [onnxtype.tensor("W", OnnxFloat, [2, 2], bytes.zeros(15))],
+        doc: "" }
+    let src = written(model_of(g))
+
+    test.case("fifteen bytes is not four float32 elements")
+    match onnxio.read(src, onnxio.default_limits())
+        Ok(_)  =>
+            test.fail("fifteen bytes read as a tensor of sixteen")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "tensor_size_mismatch")
+            match e
+                OnnxTensorSizeMismatch(name, declared, from_dims) =>
+                    test.assert_eq_str(name, "W")
+                    test.assert_eq(declared, 15)
+                    test.assert_eq(from_dims, 16)
+                _                                                 =>
+                    test.fail("that is the wrong refusal")
+
+    test.case("reading only the structure does not check what it never read")
+    match onnxio.read(src, onnxio.structure_only())
+        Ok(back) =>
+            let init = onnxgraph.main_graph(back).initializer
+            test.assert_eq(list.len(init), 1)
+            test.assert_eq(list.get(list.get(init, 0).dims, 0), 2)
+            test.assert_eq(bytes.len(list.get(init, 0).raw), 0)
+        Err(e)   =>
+            test.fail("a structure read reads no data to check: ${e.message()}")
+
+@test
+fn test_a_string_tensor_carries_no_byte_length_to_check() [io]
+    // A STRING tensor's data is `string_data`, its elements are
+    // variable width, and `element_bytes` answers zero for it — so
+    // there is no length the shape could imply and nothing to refuse.
+    // An empty string is an element like any other and keeps its place.
+    let g = OnnxGraph { name: "g", node: [], input: [], output: [], value_info: [],
+        initializer: [OnnxTensor { name: "S", data_type: OnnxString, dims: [2],
+                                   raw: bytes.zeros(0),
+                                   strings: ["ab", ""], external_location: "" }],
+        doc: "" }
+    let back = round_trip(model_of(g))
+    let t = list.get(onnxgraph.main_graph(back).initializer, 0)
+    test.assert(t.data_type == OnnxString)
+    test.assert_eq(list.len(t.strings), 2)
+    test.assert_eq_str(list.get(t.strings, 0), "ab")
+    test.assert_eq_str(list.get(t.strings, 1), "")
+    test.assert_eq(bytes.len(t.raw), 0)
+
+// ── What a node consumes ────────────────────────────────────────────
+
+@test
+fn test_a_name_nothing_produces_is_reported_and_not_refused() [io]
+    // Requirement, stated plainly: `onnxio.read` does NOT validate the
+    // graph.  It cannot — a file's nodes are read before anything is
+    // known about what the model contains, and a subgraph may capture a
+    // name the flat table does not record.  So a dangling input is a
+    // FINDING from `onnxcheck`, reported with the name, and the model
+    // still reads.
+    let g = OnnxGraph { name: "g",
+        node: [onnxgraph.node("n", "Relu", ["missing"], ["y"])],
+        input: [], output: [onnxtype.value_info("y", OnnxFloat, onnxtype.fixed_shape([1]))],
+        value_info: [], initializer: [], doc: "" }
+    let back = round_trip(model_of(g))
+
+    test.case("the read is not the refusal")
+    test.assert_eq(list.len(onnxgraph.main_graph(back).node), 1)
+
+    test.case("the checker names the value")
+    test.assert_eq(list.len(onnxcheck.dangling_inputs(back)), 1)
+    test.assert_eq_str(list.get(onnxcheck.dangling_inputs(back), 0), "missing")
+    test.assert(onnxcheck.has_errors(onnxcheck.check(back)))
+    test.assert(any_code(onnxcheck.check(back), "dangling_input"))
+
+@test
+fn test_a_name_produced_by_any_of_the_three_sources_is_not_dangling() [io]
+    // The other half, and the half a fixture set of broken models never
+    // checks: an initializer, a graph input and an earlier node's output
+    // each satisfy a consumer, and a checker that reported any of them
+    // would be useless on every correct model.
+    let g = OnnxGraph { name: "g",
+        node: [onnxgraph.node("first", "Relu", ["x"], ["h"]),
+               onnxgraph.node("second", "Relu", ["h", "W", "gin"], ["y"])],
+        input: [onnxtype.value_info("gin", OnnxFloat, onnxtype.fixed_shape([1]))],
+        output: [onnxtype.value_info("y", OnnxFloat, onnxtype.fixed_shape([1]))],
+        value_info: [],
+        initializer: [onnxtype.tensor("W", OnnxFloat, [1], bytes.zeros(4)),
+                      onnxtype.tensor("x", OnnxFloat, [1], bytes.zeros(4))],
+        doc: "" }
+    let back = round_trip(model_of(g))
+    test.assert_eq(list.len(onnxcheck.dangling_inputs(back)), 0)
+    test.assert(not any_code(onnxcheck.check(back), "dangling_input"))
+
+@test
+fn test_a_produced_name_nobody_consumes_is_reported_as_unused() [io]
+    // Dead weight rather than an error: a pruned model keeps them and
+    // a tool that strips them wants the list.  The two names that are
+    // NOT unused are the two the rule has to get right — one consumed
+    // by a later node, one a graph output.
+    let g = OnnxGraph { name: "g",
+        node: [onnxgraph.node("a", "Relu", ["x"], ["y", "dead"]),
+               onnxgraph.node("b", "Relu", ["y"], ["z"])],
+        input: [], output: [onnxtype.value_info("z", OnnxFloat, onnxtype.fixed_shape([1]))],
+        value_info: [], initializer: [], doc: "" }
+    let back = round_trip(model_of(g))
+    let unused = onnxcheck.unused_outputs(back)
+    test.assert_eq(list.len(unused), 1)
+    test.assert_eq_str(list.get(unused, 0), "dead")
+
+// ── The data that is not in the file ────────────────────────────────
+
+@test
+fn test_an_external_tensor_is_named_refused_and_supplied_back() [io]
+    // Protobuf cannot hold more than two gigabytes, so the large models
+    // keep their weights beside them and carry a file name.  Both
+    // directions have to work: the refusal has to say which file, and
+    // the caller that read the file has to be able to hand the bytes
+    // back.
+    let g = OnnxGraph { name: "g", node: [], input: [], output: [], value_info: [],
+        initializer: [onnxtype.tensor("W", OnnxFloat, [2], bytes.zeros(8)),
+                      onnxtype.tensor("B", OnnxFloat, [1], bytes.zeros(4))],
+        doc: "" }
+    let m = model_of(g)
+
+    test.case("the threshold is a strict bound, so the tensor on it stays in the file")
+    let pair = externalized(m, "weights.bin", 4)
+    let moved = pair.0
+    let blob = pair.1
+    test.assert_eq(bytes.len(blob), 8)
+    test.assert_eq(list.len(onnxio.external_files(moved)), 1)
+    test.assert_eq_str(list.get(onnxio.external_files(moved), 0), "weights.bin")
+    let init = onnxgraph.main_graph(moved).initializer
+    test.assert(onnxtype.is_external(list.get(init, 0)))
+    test.assert_eq_str(list.get(init, 0).external_location, "weights.bin")
+    test.assert_eq(bytes.len(list.get(init, 0).raw), 0)
+    test.assert(not onnxtype.is_external(list.get(init, 1)))
+    test.assert_eq(bytes.len(list.get(init, 1).raw), 4)
+
+    test.case("a file whose weights are elsewhere is refused, and names the file")
+    let src = written(moved)
+    match onnxio.read(src, onnxio.default_limits())
+        Ok(_)  =>
+            test.fail("its weights are in another file")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "external_data")
+            test.assert_eq_str(onnxfault.external_location(e), "weights.bin")
+            test.assert(onnxfault.needs_external_file(e))
+
+    test.case("reading only the structure is not refused, and keeps the location")
+    let structural = match onnxio.read(src, onnxio.structure_only())
+        Ok(back) => back
+        Err(_)   =>
+            core.panic.panic("onnx_edge_tests: a structure read refuses no external tensor")
+    let st = list.get(onnxgraph.main_graph(structural).initializer, 0)
+    test.assert(onnxtype.is_external(st))
+    test.assert_eq_str(st.external_location, "weights.bin")
+
+    test.case("and the caller that read the file hands the bytes back")
+    let whole = match onnxio.attach_external(structural, "W", blob)
+        Ok(back) => back
+        Err(_)   =>
+            core.panic.panic("onnx_edge_tests: attach_external refused bytes of the right length")
+    let wt = list.get(onnxgraph.main_graph(whole).initializer, 0)
+    test.assert(not onnxtype.is_external(wt))
+    test.assert_eq_str(bytes.to_hex(wt.raw), bytes.to_hex(blob))
+
+    test.case("bytes of the wrong length are the same refusal a read gives")
+    match onnxio.attach_external(m, "W", bytes.zeros(3))
+        Ok(_)  =>
+            test.fail("three bytes is not two float32 elements")
+        Err(e) =>
+            match e
+                OnnxTensorSizeMismatch(name, declared, from_dims) =>
+                    test.assert_eq_str(name, "W")
+                    test.assert_eq(declared, 3)
+                    test.assert_eq(from_dims, 8)
+                _                                                 =>
+                    test.fail("that is the wrong refusal")
+
+    test.case("a tensor the model does not have is refused too")
+    match onnxio.attach_external(m, "Nope", bytes.zeros(4))
+        Ok(_)  =>
+            test.fail("there is no tensor named Nope")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "tensor_size_mismatch")
+
+    test.case("and externalizing to a nameless file is refused before it writes")
+    match onnxio.externalize(m, "", 4)
+        Ok(_)  =>
+            test.fail("the bytes would have nowhere to live")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "external_data")
+
+    test.case("a model with nothing to move externalizes to an empty blob")
+    let small = model_with(onnxtype.tensor("tiny", OnnxFloat, [1], bytes.zeros(4)))
+    match onnxio.externalize(small, "weights.bin", 1024)
+        Ok(p)  =>
+            test.assert_eq(bytes.len(p.1), 0)
+            test.assert_eq(list.len(onnxio.external_files(p.0)), 0)
+        Err(e) =>
+            test.fail("nothing was over the threshold: ${e.message()}")
+
+// ── The limits, and the size of a message ───────────────────────────
+
+@test
+fn test_the_byte_ceiling_is_inclusive_and_the_node_ceiling_is_counted() [io]
+    let g = OnnxGraph { name: "g",
+        node: [onnxgraph.node("a", "Relu", ["x"], ["y"])],
+        input: [], output: [], value_info: [], initializer: [], doc: "" }
+    let src = written(model_of(g))
+    let l = onnxio.default_limits()
+
+    test.case("a file exactly at the ceiling is read")
+    match onnxio.read(src, onnxio.with_max_bytes(l, bytes.len(src)))
+        Ok(back) =>
+            test.assert_eq(list.len(onnxgraph.main_graph(back).node), 1)
+        Err(e)   =>
+            test.fail("the ceiling is a bound and not an exclusion: ${e.message()}")
+
+    test.case("and one byte over it is refused, with both numbers")
+    match onnxio.read(src, onnxio.with_max_bytes(l, bytes.len(src) - 1))
+        Ok(_)  =>
+            test.fail("the file is longer than the ceiling")
+        Err(e) =>
+            match e
+                OnnxTooLarge(size, limit) =>
+                    test.assert_eq(size, bytes.len(src))
+                    test.assert_eq(limit, bytes.len(src) - 1)
+                _                         =>
+                    test.fail("that is the wrong refusal")
+
+    test.case("the depth ceiling counts the model as nought, its graph as one and a node as two")
+    match onnxio.read(src, onnxio.with_max_depth(l, 0))
+        Ok(_)  =>
+            test.fail("a graph is one level below the model")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "too_deep")
+    // And the model itself is level NOUGHT, which a ceiling of nought
+    // does not refuse: a file with no graph still answers what it says
+    // rather than reporting a depth it never reached.
+    match onnxio.read(bytes.from_byte_list([0x08, 0x0A]), onnxio.with_max_depth(l, 0))
+        Ok(_)  =>
+            test.fail("the file has no graph")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "no_graph")
+    match onnxio.read(src, onnxio.with_max_depth(l, 1))
+        Ok(_)  =>
+            test.fail("a graph's node is one level below the graph")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "too_deep")
+    match onnxio.read(src, onnxio.with_max_depth(l, 2))
+        Ok(back) =>
+            test.assert_eq(list.len(onnxgraph.main_graph(back).node), 1)
+        Err(e)   =>
+            test.fail("a model, a graph and a node is three levels: ${e.message()}")
+
+    test.case("the node ceiling is counted, and a graph over it is refused")
+    let two = model_of(OnnxGraph { name: "g",
+        node: [onnxgraph.node("a", "Relu", ["x"], ["y"]),
+               onnxgraph.node("b", "Relu", ["y"], ["z"])],
+        input: [], output: [], value_info: [], initializer: [], doc: "" })
+    let strict = OnnxReadLimits { max_depth: l.max_depth, max_bytes: l.max_bytes,
+                                  max_nodes: 1, read_tensor_data: true }
+    match onnxio.read(written(two), strict)
+        Ok(_)  =>
+            test.fail("the graph holds two nodes and the ceiling is one")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "too_large")
+
+// ── A file that is not a model ──────────────────────────────────────
+
+@test
+fn test_a_known_field_on_the_wrong_wire_is_refused_at_its_key() [io]
+    // A field number this package knows, arriving on a wire type
+    // `onnx.proto` does not give it, is not a field to skip: these
+    // bytes are not `ModelProto`, and saying so at the offset is what
+    // makes the refusal usable on a file somebody truncated or
+    // concatenated.
+    test.case("ir_version is a varint, and a length-delimited field 1 is not it")
+    match onnxio.read_header(bytes.from_byte_list([0x0A, 0x00]))
+        Ok(_)  =>
+            test.fail("field 1 is a varint")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "wrong_wire_type")
+            match e
+                OnnxWrongWireType(offset, field, found, expected) =>
+                    test.assert_eq(offset, 0)
+                    test.assert_eq(field, 1)
+                    test.assert_eq(found, 2)
+                    test.assert_eq(expected, 0)
+                _                                                 =>
+                    test.fail("that is the wrong refusal")
+
+    test.case("a key with field zero is not a protobuf field at all")
+    match onnxio.read_header(bytes.from_byte_list([0x00]))
+        Ok(_)  =>
+            test.fail("field zero is not a field")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "not_protobuf")
+
+    test.case("and a string that is not UTF-8 names the byte")
+    match onnxio.read_header(bytes.from_byte_list([0x12, 0x01, 0xFF]))
+        Ok(_)  =>
+            test.fail("0xFF is not UTF-8")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "bad_utf8")
+            test.assert_eq(onnxfault.offset_of(e), 2)
+
+@test
+fn test_a_field_the_package_does_not_know_is_stepped_over() [io]
+    // Protobuf's oldest rule: a reader that meets a field number it
+    // does not know skips it and keeps reading, which is what makes a
+    // file written by a newer ONNX readable at all.  Each wire type
+    // has to be walked differently, and a reader that only handled
+    // varints would lose every field after the first length-delimited
+    // one it did not know.
+    test.case("an unknown varint and an unknown length-delimited field in a tensor")
+    let t = vf(1, 1) + vf(2, 1) + ld(99, bytes.from_byte_list([1, 2, 3]))
+        + vf(98, 7) + ld(9, bytes.from_byte_list([0, 0, 0x80, 0x3F]))
+    let m = read_ok(model_with_initializer(t))
+    let back = list.get(onnxgraph.main_graph(m).initializer, 0)
+    test.assert_eq_str(bytes.to_hex(back.raw), "0000803f")
+    test.assert_eq(back.data_type, OnnxFloat)
+
+    test.case("and an unknown field between a node's name and its op type")
+    let body = ld(3, bytes.from_byte_list([0x6e])) + vf(30, 5)
+        + ld(4, bytes.from_byte_list([0x52, 0x65, 0x6c, 0x75]))
+    let m2 = read_ok(model_with_node(body))
+    let n = list.get(onnxgraph.main_graph(m2).node, 0)
+    test.assert_eq_str(n.name, "n")
+    test.assert_eq_str(n.op_type, "Relu")
+
+    test.case("and a well-formed group is walked, not lost in")
+    // Wire type 3 opens a group and 4 closes it, under the same field
+    // number both times.  Nothing in onnx.proto uses one, but an
+    // unknown field is stepped over wherever it is — and a reader that
+    // lost its place inside a group would read every field after it as
+    // garbage, so the `i` that follows is what this asserts.
+    let grouped = key(30, 3) + vf(1, 7) + key(30, 4) + vf(3, 5)
+    let mg = read_ok(model_with_node(ld(5, ld(1, bytes.from_byte_list([0x61])) + grouped)))
+    let ng = list.get(onnxgraph.main_graph(mg).node, 0)
+    match onnxattr.as_int(list.get(ng.attribute, 0))
+        Some(v) =>
+            test.assert_eq(v, 5)
+        None    =>
+            test.fail("the field after the group is the attribute's int")
+
+    test.case("and a group whose end tag names another field is not protobuf")
+    // The end tag closes the group opened for the SAME field number.  An
+    // end tag for a different one leaves the group open at the end of
+    // the message, which is not a message at all, and the refusal is the
+    // same `not_protobuf` a field with a truncated body gets.
+    let attr = ld(1, bytes.from_byte_list([0x61])) + key(14, 3)
+        + vf(1, 5) + key(15, 4)
+    test.assert_eq_str(read_code(model_with_node(ld(5, attr))), "not_protobuf")
+
+@test
+fn test_the_ir_version_ceiling_is_checked_and_its_boundary_is_readable() [io]
+    test.case("the version this package models is not refused")
+    match onnxio.read_header(bytes.from_byte_list([0x08, 0x0A]))
+        Ok(_)  =>
+            test.assert(true)
+        Err(e) =>
+            test.fail("ir_version 10 is the ceiling and not over it: ${e.message()}")
+
+    test.case("and one above it is, with both numbers")
+    match onnxio.read_header(bytes.from_byte_list([0x08, 0x0B]))
+        Ok(_)  =>
+            test.fail("ir_version 11 is newer than the package models")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "ir_version_too_new")
+            match e
+                OnnxIrVersionTooNew(found, supported) =>
+                    test.assert_eq(found, 11)
+                    test.assert_eq(supported, onnxopset.ONNX_MAX_IR_VERSION)
+                _                                     =>
+                    test.fail("that is the wrong refusal")
+
+// ── The header alone, and the fields the package does not model ─────
+
+@test
+fn test_the_header_answers_without_reading_the_graph() [io]
+    // The cheapest useful question: whether a runtime can load a model
+    // is decided by its opset imports, and they are the first few
+    // hundred bytes of the file.  A header read answers the header and
+    // a usable empty model, and walks none of the nodes.
+    let g = OnnxGraph { name: "g",
+        node: [onnxgraph.node("n", "Relu", ["x"], ["y"])],
+        input: [], output: [], value_info: [], initializer: [], doc: "" }
+    let h = header_of(written(model_of(g)))
+    test.assert_eq(h.ir_version, 10)
+    test.assert_eq_str(h.producer_name, "onnx-nv tests")
+    test.assert_eq(list.len(h.opset_import), 1)
+    test.assert_eq_str(list.get(h.opset_import, 0).domain, "")
+    test.assert_eq(list.get(h.opset_import, 0).version, 17)
+
+    test.case("and the graph is not walked, so the model it answers has none")
+    test.assert_eq(list.len(h.graphs), 1)
+    test.assert_eq(list.len(onnxgraph.main_graph(h).node), 0)
+
+@test
+fn test_a_model_level_field_the_package_does_not_model_comes_back() [io]
+    // `pbunknown` holds the MODEL message's unmodelled fields and
+    // `write` puts them back, so a file written by a newer ONNX —
+    // `metadata_props` here, field 14 — round trips byte for byte.  It
+    // is the difference between a tool people trust with their weights
+    // and one they do not.
+    let m = model_of(OnnxGraph { name: "g", node: [], input: [], output: [],
+                                 value_info: [], initializer: [], doc: "" })
+    let base = written(m)
+    // A StringStringEntryProto at field 14: its key, its length, "abc".
+    let with_meta = base + ld(14, ld(1, bytes.from_byte_list([0x61]))
+                                  + ld(2, bytes.from_byte_list([0x62, 0x63])))
+
+    let again = written(read_ok(with_meta))
+    test.assert_eq_str(bytes.to_hex(again), bytes.to_hex(with_meta))
+
+@test
+fn test_an_attribute_field_the_package_does_not_model_is_kept_as_bytes() [io]
+    // `AttributeProto` has four value fields this package keeps whole
+    // rather than interpreting: `tp` and `type_protos` are TypeProtos,
+    // `sparse_tensor` and `sparse_tensors` are SparseTensors.  The
+    // FIELD NUMBER is what names the kind — the `type` field need not
+    // be there at all — and the bytes are kept as the file held them,
+    // key and all, so that a write puts a well-formed field back.
+    test.case("a tp attribute is kept whole under its own kind")
+    let attr = ld(1, bytes.from_byte_list([0x61])) + ld(14, bytes.from_byte_list([0x00]))
+    let m = read_ok(model_with_node(ld(5, attr)))
+    let n = list.get(onnxgraph.main_graph(m).node, 0)
+    test.assert_eq(list.len(n.attribute), 1)
+    let a = list.get(n.attribute, 0)
+    test.assert_eq_str(a.name, "a")
+    test.assert(onnxattr.kind_of(a.value) == OnnxAttrKindTypeProto)
+    match a.value
+        OnnxAttrRaw(_, data) =>
+            test.assert_eq_str(bytes.to_hex(data), "720100")
+        _                    =>
+            test.fail("a type proto is kept as the bytes the file held")
+
+    test.case("and a sparse_tensor attribute is the other kind")
+    let attr2 = ld(1, bytes.from_byte_list([0x61])) + ld(22, bytes.from_byte_list([0x00]))
+    let m2 = read_ok(model_with_node(ld(5, attr2)))
+    let sparse_node = list.get(onnxgraph.main_graph(m2).node, 0)
+    let a2 = list.get(sparse_node.attribute, 0)
+    test.assert(onnxattr.kind_of(a2.value) == OnnxAttrKindSparseTensor)
+    match a2.value
+        OnnxAttrRaw(_, data) =>
+            test.assert_eq_str(bytes.to_hex(data), "b2010100")
+        _                    =>
+            test.fail("a sparse tensor is kept as the bytes the file held")
+
+    test.case("and the two REPEATED value fields fold into those same two kinds")
+    // `type_protos` (15) and `sparse_tensors` (23) are the repeated
+    // spellings of the same two kinds, and this package's kind table
+    // has a word for the kind and not for its cardinality — so both
+    // readings answer the kind.  A reader that keyed the kind off the
+    // field number alone would call `type_protos` a sparse tensor.
+    let attr3 = ld(1, bytes.from_byte_list([0x61])) + ld(15, bytes.from_byte_list([0x00]))
+    let m3 = read_ok(model_with_node(ld(5, attr3)))
+    let n3 = list.get(onnxgraph.main_graph(m3).node, 0)
+    let a3 = list.get(n3.attribute, 0)
+    test.assert(onnxattr.kind_of(a3.value) == OnnxAttrKindTypeProto)
+
+    let attr4 = ld(1, bytes.from_byte_list([0x61])) + ld(23, bytes.from_byte_list([0x00]))
+    let m4 = read_ok(model_with_node(ld(5, attr4)))
+    let n4 = list.get(onnxgraph.main_graph(m4).node, 0)
+    let a4 = list.get(n4.attribute, 0)
+    test.assert(onnxattr.kind_of(a4.value) == OnnxAttrKindSparseTensor)
+
+@test
+fn test_a_model_this_package_wrote_reads_and_writes_to_the_same_bytes() [io]
+    // The reader is the writer's inverse on the files the writer makes,
+    // which is the property every other round trip in this file leans
+    // on without saying so.
+    let g = OnnxGraph { name: "g", node: [],
+        input: [onnxtype.value_info("x", OnnxFloat, onnxtype.fixed_shape([1]))],
+        output: [], value_info: [], initializer: [], doc: "" }
+    let once = written(model_of(g))
+    let twice = written(read_ok(once))
+    test.assert_eq_str(bytes.to_hex(twice), bytes.to_hex(once))
+
+@test
+fn test_the_main_graph_is_slot_zero_and_a_subgraph_follows_it() [io]
+    // A graph that held its subgraphs directly would be a recursive
+    // value type, so they are flat and an attribute names one by
+    // index.  The main graph is ALWAYS slot zero — which is what
+    // `OnnxModel.main` means — and every subgraph follows in read
+    // order, which is the property that would silently break a model
+    // whose main graph held a control-flow node.
+    let sub = OnnxGraph { name: "body", node: [], input: [], output: [],
+                          value_info: [], initializer: [], doc: "" }
+    let body = OnnxAttribute { name: "body", declared: OnnxAttrKindGraph,
+                               value: OnnxAttrGraph(1), ref_name: "" }
+    let n = OnnxNode { name: "loop", op_type: "Loop", domain: "", input: [],
+                       output: [], attribute: [body], doc: "" }
+    let main = OnnxGraph { name: "g", node: [n], input: [], output: [],
+                           value_info: [], initializer: [], doc: "" }
+    let m = OnnxModel { ir_version: 10, opset_import: [onnxgraph.opset_import("", 17)],
+                        producer_name: "onnx-nv tests", producer_version: "0.1.0",
+                        domain: "", model_version: 1, doc: "", main: 0,
+                        graphs: [main, sub], unknown: onnxgraph.empty_model().unknown }
+    let back = round_trip(m)
+
+    test.case("both graphs are there and the main one is where `main` says")
+    test.assert_eq(list.len(back.graphs), 2)
+    test.assert_eq(back.main, 0)
+    test.assert_eq_str(onnxgraph.main_graph(back).name, "g")
+
+    test.case("the subgraph rides inside the attribute that holds it")
+    let na = list.get(onnxgraph.main_graph(back).node, 0)
+    test.assert_eq_str(na.op_type, "Loop")
+    let a = list.get(na.attribute, 0)
+    test.assert_eq_str(a.name, "body")
+    test.assert_eq(list.len(onnxattr.subgraph_indices(a)), 1)
+    test.assert_eq(list.get(onnxattr.subgraph_indices(a), 0), 1)
+    test.assert_eq_str(list.get(back.graphs, 1).name, "body")
+
+    test.case("and the walk over the flat table still reaches its node")
+    test.assert_eq(list.len(onnxgraph.all_nodes(back)), 1)
+
+@test
+fn test_an_attribute_index_past_the_table_writes_an_empty_graph() [io]
+    // A model a caller built by hand can name a subgraph that is not
+    // there.  Refusing to write it would be defensible; answering an
+    // empty graph is what a reader does with an index it cannot
+    // resolve, and the model still encodes.
+    let body = OnnxAttribute { name: "body", declared: OnnxAttrKindGraph,
+                               value: OnnxAttrGraph(9), ref_name: "" }
+    let n = OnnxNode { name: "loop", op_type: "Loop", domain: "", input: [],
+                       output: [], attribute: [body], doc: "" }
+    let m = model_of(OnnxGraph { name: "g", node: [n], input: [], output: [],
+                                 value_info: [], initializer: [], doc: "" })
+    let back = read_ok(written(m))
+    test.assert_eq(list.len(back.graphs), 2)
+    test.assert_eq_str(list.get(back.graphs, 1).name, "")
+    let loop_node = list.get(onnxgraph.main_graph(back).node, 0)
+    let a = list.get(loop_node.attribute, 0)
+    test.assert_eq(list.get(onnxattr.subgraph_indices(a), 0), 1)
+
+// ── Attributes, and the length a write promises ─────────────────────
+
+@test
+fn test_an_attribute_round_trips_and_its_declared_kind_comes_from_the_file() [io]
+    let a1 = onnxattr.ints_attr("axes", [])
+    let a2 = onnxattr.ints_attr("kernel_shape", [3, 3])
+    let a3 = onnxattr.floats_attr("scales", [0.5, 2.0])
+    let a4 = onnxattr.string_attr("mode", "nearest")
+    let a5 = onnxattr.int_attr("axis", 1)
+    let n = OnnxNode { name: "resize", op_type: "Resize", domain: "", input: [],
+                       output: [], attribute: [a1, a2, a3, a4, a5], doc: "" }
+    let back = round_trip(model_of(OnnxGraph { name: "g", node: [n], input: [],
+        output: [], value_info: [], initializer: [], doc: "" }))
+    // The node is bound BEFORE its attribute list is read: a list
+    // field taken straight off a `list.get` result is a view of a
+    // temporary, and this compiler hands back an empty list for it.
+    let resize = list.get(onnxgraph.main_graph(back).node, 0)
+    let attrs = resize.attribute
+    test.assert_eq(list.len(attrs), 5)
+
+    test.case("the names come back in the order the file held them")
+    test.assert_eq_str(list.get(attrs, 0).name, "axes")
+    test.assert_eq_str(list.get(attrs, 4).name, "axis")
+
+    test.case("an empty list of numbers is still a list of numbers")
+    let axes = list.get(attrs, 0)
+    test.assert(onnxattr.kind_of(axes.value) == OnnxAttrKindInts)
+    match onnxattr.as_ints(axes)
+        Some(xs) =>
+            test.assert_eq(list.len(xs), 0)
+        None     =>
+            test.fail("an empty INTS attribute is not a value of unknown kind")
+
+    test.case("and so is a list with numbers in it")
+    let ks = list.get(attrs, 1)
+    test.assert(onnxattr.kind_of(ks.value) == OnnxAttrKindInts)
+    match onnxattr.as_ints(ks)
+        Some(xs) =>
+            test.assert_eq(list.len(xs), 2)
+            test.assert_eq(list.get(xs, 0), 3)
+        None     =>
+            test.fail("it is a list of two")
+
+    test.case("floats, strings and integers each keep their own kind")
+    test.assert(onnxattr.kind_of(list.get(attrs, 2).value) == OnnxAttrKindFloats)
+    test.assert(onnxattr.kind_of(list.get(attrs, 3).value) == OnnxAttrKindString)
+    test.assert(onnxattr.kind_of(list.get(attrs, 4).value) == OnnxAttrKindInt)
+    match onnxattr.as_string(list.get(attrs, 3))
+        Some(s) =>
+            test.assert_eq_str(s, "nearest")
+        None    =>
+            test.fail("it is a string")
+    match onnxattr.as_int(list.get(attrs, 4))
+        Some(v) =>
+            test.assert_eq(v, 1)
+        None    =>
+            test.fail("it is an integer")
+
+    test.case("and every one of them is consistent with its declaration")
+    for a in attrs
+        test.assert(onnxattr.is_consistent(a))
+
+@test
+fn test_the_three_list_attributes_keep_their_elements_and_their_order() [io]
+    // Strings, Tensors and Graphs are the list kinds that have no
+    // empty spelling on the wire, so a non-empty one is the only way
+    // to write them at all: each element is its own field, in the
+    // list's order, and a reader that dropped the repetition would
+    // answer a one-element list.
+    let s = OnnxAttribute { name: "modes", declared: OnnxAttrKindStrings,
+                            value: OnnxAttrStrings(["nearest", "linear"]), ref_name: "" }
+    let ts = OnnxAttribute { name: "values", declared: OnnxAttrKindTensors,
+                             value: OnnxAttrTensors(
+                                 [onnxtype.tensor("t1", OnnxFloat, [1], bytes.zeros(4)),
+                                  onnxtype.tensor("t2", OnnxFloat, [2], bytes.zeros(8))]),
+                             ref_name: "" }
+    let bodies = OnnxAttribute { name: "bodies", declared: OnnxAttrKindGraphs,
+                                 value: OnnxAttrGraphs([1, 2]), ref_name: "" }
+    let n = OnnxNode { name: "scan", op_type: "Scan", domain: "", input: [], output: [],
+                       attribute: [s, ts, bodies], doc: "" }
+    let main = OnnxGraph { name: "g", node: [n], input: [], output: [], value_info: [],
+                           initializer: [], doc: "" }
+    let one = OnnxGraph { name: "first", node: [], input: [], output: [], value_info: [],
+                          initializer: [], doc: "" }
+    let two = OnnxGraph { name: "second", node: [], input: [], output: [], value_info: [],
+                          initializer: [], doc: "" }
+    let m = OnnxModel { ir_version: 10, opset_import: [onnxgraph.opset_import("", 17)],
+                        producer_name: "onnx-nv tests", producer_version: "0.1.0",
+                        domain: "", model_version: 1, doc: "", main: 0,
+                        graphs: [main, one, two], unknown: onnxgraph.empty_model().unknown }
+    let back = round_trip(m)
+
+    test.case("a list of strings comes back in the order it was written")
+    let node = list.get(onnxgraph.main_graph(back).node, 0)
+    let a0 = list.get(node.attribute, 0)
+    test.assert(onnxattr.kind_of(a0.value) == OnnxAttrKindStrings)
+    match a0.value
+        OnnxAttrStrings(xs) =>
+            test.assert_eq(list.len(xs), 2)
+            test.assert_eq_str(list.get(xs, 0), "nearest")
+            test.assert_eq_str(list.get(xs, 1), "linear")
+        _                   =>
+            test.fail("it is a list of two strings")
+
+    test.case("and a list of tensors")
+    let a1 = list.get(node.attribute, 1)
+    test.assert(onnxattr.kind_of(a1.value) == OnnxAttrKindTensors)
+    match a1.value
+        OnnxAttrTensors(xs) =>
+            test.assert_eq(list.len(xs), 2)
+            let first = list.get(xs, 0)
+            let second = list.get(xs, 1)
+            test.assert_eq_str(first.name, "t1")
+            test.assert_eq_str(second.name, "t2")
+            test.assert_eq(bytes.len(second.raw), 8)
+        _                   =>
+            test.fail("it is a list of two tensors")
+
+    test.case("and a list of graphs, which land in the model's own table in order")
+    let a2 = list.get(node.attribute, 2)
+    test.assert_eq(list.len(onnxattr.subgraph_indices(a2)), 2)
+    test.assert_eq(list.get(onnxattr.subgraph_indices(a2), 0), 1)
+    test.assert_eq(list.get(onnxattr.subgraph_indices(a2), 1), 2)
+    test.assert_eq(list.len(back.graphs), 3)
+    test.assert_eq_str(list.get(back.graphs, 1).name, "first")
+    test.assert_eq_str(list.get(back.graphs, 2).name, "second")
+
+@test
+fn test_the_written_length_is_the_length_that_was_asked_for_first() [io]
+    // The writer measures every message before it writes it and stops
+    // the process if the two disagree, so this equality is the property
+    // that makes the sized path safe rather than the arithmetic being
+    // right by inspection.
+    let g = OnnxGraph { name: "g",
+        node: [onnxgraph.node("a", "Conv", ["x", "W"], ["y"])],
+        input: [onnxtype.value_info("x", OnnxFloat, onnxtype.fixed_shape([1, 3, 8, 8]))],
+        output: [onnxtype.value_info("y", OnnxFloat, onnxtype.fixed_shape([1, 4, 6, 6]))],
+        value_info: [],
+        initializer: [onnxtype.tensor("W", OnnxFloat, [4, 3, 3, 3], bytes.zeros(432))],
+        doc: "" }
+    let m = model_of(g)
+    let size = sized(m)
+    let src = written(m)
+    test.assert_eq(bytes.len(src), size)
+    test.assert(not onnxio.exceeds_protobuf_limit(m))
+
+    test.case("the bytes are the file the reader reads back")
+    let back = read_ok(src)
+    test.assert_eq(list.len(onnxgraph.main_graph(back).node), 1)
+    test.assert_eq(list.len(onnxgraph.main_graph(back).initializer), 1)
+    test.assert_eq(bytes.len(list.get(onnxgraph.main_graph(back).initializer, 0).raw), 432)
+
+// ── What a write refuses ────────────────────────────────────────────
+
+@test
+fn test_a_model_that_cannot_load_is_not_written() [io]
+    // Two things a caller can build by hand that no runtime can load:
+    // a node in a domain the model does not import, and an attribute
+    // whose declared kind is not the kind of its value.  Both are
+    // refused before a file exists rather than by the runtime that
+    // reads it.
+    test.case("a node in an unimported domain")
+    let n = OnnxNode { name: "custom", op_type: "MyOp", domain: "com.example",
+                       input: [], output: [], attribute: [], doc: "" }
+    let m = model_of(OnnxGraph { name: "g", node: [n], input: [], output: [],
+                                 value_info: [], initializer: [], doc: "" })
+    match onnxio.encoded_len(m)
+        Ok(_)  =>
+            test.fail("nothing can load com.example.MyOp")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "no_opset_import")
+
+    test.case("an attribute declared INT that holds a string")
+    let bad = OnnxAttribute { name: "axis", declared: OnnxAttrKindInt,
+                              value: OnnxAttrString("one"), ref_name: "" }
+    let m2 = model_of(OnnxGraph { name: "g", node: [onnxgraph.with_attribute(
+        onnxgraph.node("n", "Relu", ["x"], ["y"]), bad)],
+        input: [], output: [],
+        value_info: [], initializer: [], doc: "" })
+    match onnxio.write(m2)
+        Ok(_)  =>
+            test.fail("the declaration and the value disagree")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "attribute_type_mismatch")
+
+    test.case("and the same node with a value of its declared kind is written")
+    let good = onnxattr.int_attr("axis", 1)
+    let m3 = model_of(OnnxGraph { name: "g", node: [onnxgraph.with_attribute(
+        onnxgraph.node("n", "Relu", ["x"], ["y"]), good)],
+        input: [], output: [],
+        value_info: [], initializer: [], doc: "" })
+    match onnxio.write(m3)
+        Ok(b)  =>
+            test.assert(bytes.len(b) > 0)
+        Err(e) =>
+            test.fail("a consistent attribute is writable: ${e.message()}")
+
+// ── The tables beside the reader ────────────────────────────────────
+//
+// The type table, the attribute-kind table and the refusal table are
+// the package's three closed vocabularies.  Each is small, each is
+// driven by bytes the package did not write, and a wrong arm in any of
+// them is invisible until a model is misread or refused in a way
+// nobody can act on — so each is walked in full rather than sampled.
+
+// The message of the first finding with a code, or `""`.
+fn message_of(findings: [OnnxFinding], code: Str) -> Str []
+    for f in findings
+        if f.code == code
+            return f.message
+    ""
+
+@test
+fn test_the_data_type_table_answers_both_ways_for_every_type() [io]
+    // The codes are `onnx.proto`'s and the names are the
+    // specification's, and both directions are read: the file's code
+    // decides what a tensor's bytes mean, and the width decides how
+    // many of them there are.
+    let types: [OnnxDataType] = [OnnxUndefined, OnnxFloat, OnnxUint8, OnnxInt8,
+        OnnxUint16, OnnxInt16, OnnxInt32, OnnxInt64, OnnxString, OnnxBool,
+        OnnxFloat16, OnnxDouble, OnnxUint32, OnnxUint64, OnnxComplex64,
+        OnnxComplex128, OnnxBfloat16]
+    let names: [Str] = ["UNDEFINED", "FLOAT", "UINT8", "INT8", "UINT16", "INT16",
+        "INT32", "INT64", "STRING", "BOOL", "FLOAT16", "DOUBLE", "UINT32",
+        "UINT64", "COMPLEX64", "COMPLEX128", "BFLOAT16"]
+    let widths: [Int] = [0, 4, 1, 1, 2, 2, 4, 8, 0, 1, 2, 8, 4, 8, 8, 16, 2]
+    let floats: [Bool] = [false, true, false, false, false, false, false, false,
+        false, false, true, true, false, false, true, true, true]
+
+    test.case("every code, every name, every width, in both directions")
+    test.assert_eq(list.len(types), 17)
+    var i = 0
+    for t in types
+        test.assert_eq(onnxtype.type_code(t), i)
+        match onnxtype.type_of_code(i)
+            Ok(back) => test.assert(back == t)
+            Err(_)   =>
+                core.panic.panic("onnx_edge_tests: a code the table carries was refused")
+        test.assert_eq_str(onnxtype.type_name(t), list.get(names, i))
+        test.assert_eq(onnxtype.element_bytes(t), list.get(widths, i))
+        test.assert(onnxtype.is_float(t) == list.get(floats, i))
+        i = i + 1
+
+    test.case("and a code past the end of the table is refused, not guessed at")
+    match onnxtype.type_of_code(17)
+        Ok(_)  => test.fail("17 is past the table")
+        Err(e) => test.assert_eq_str(onnxfault.code(e), "unknown_data_type")
+    match onnxtype.type_of_code(0 - 1)
+        Ok(_)  => test.fail("no code below zero is a type")
+        Err(e) => test.assert_eq_str(onnxfault.code(e), "unknown_data_type")
+
+@test
+fn test_the_attribute_kind_table_answers_both_ways_for_every_kind() [io]
+    // The same closure over the attribute kinds, which are the other
+    // half of what an attribute's bytes can be: a kind read wrong is a
+    // graph read as a tensor.
+    let kinds: [OnnxAttrKind] = [OnnxAttrKindUndefined, OnnxAttrKindFloat,
+        OnnxAttrKindInt, OnnxAttrKindString, OnnxAttrKindTensor,
+        OnnxAttrKindGraph, OnnxAttrKindFloats, OnnxAttrKindInts,
+        OnnxAttrKindStrings, OnnxAttrKindTensors, OnnxAttrKindGraphs,
+        OnnxAttrKindSparseTensor, OnnxAttrKindTypeProto]
+    let names: [Str] = ["UNDEFINED", "FLOAT", "INT", "STRING", "TENSOR", "GRAPH",
+        "FLOATS", "INTS", "STRINGS", "TENSORS", "GRAPHS", "SPARSE_TENSOR",
+        "TYPE_PROTO"]
+
+    test.case("every kind code, and the name the specification gives it")
+    test.assert_eq(list.len(kinds), 13)
+    var i = 0
+    for k in kinds
+        test.assert_eq(onnxattr.kind_code(k), i)
+        test.assert(onnxattr.kind_of_code(i) == k)
+        test.assert_eq_str(onnxattr.kind_name(k), list.get(names, i))
+        i = i + 1
+
+    test.case("a code the table does not carry reads as UNDEFINED, which is lenient on purpose")
+    test.assert(onnxattr.kind_of_code(13) == OnnxAttrKindUndefined)
+    test.assert(onnxattr.kind_of_code(0 - 1) == OnnxAttrKindUndefined)
+
+    test.case("and a value's own kind, which is what `kind_of` reads")
+    let t = onnxtype.tensor("t", OnnxFloat, [1], bytes.zeros(4))
+    test.assert(onnxattr.kind_of(OnnxAttrFloat(1.0)) == OnnxAttrKindFloat)
+    test.assert(onnxattr.kind_of(OnnxAttrInt(1)) == OnnxAttrKindInt)
+    test.assert(onnxattr.kind_of(OnnxAttrString("s")) == OnnxAttrKindString)
+    test.assert(onnxattr.kind_of(OnnxAttrTensor(t)) == OnnxAttrKindTensor)
+    test.assert(onnxattr.kind_of(OnnxAttrGraph(0)) == OnnxAttrKindGraph)
+    test.assert(onnxattr.kind_of(OnnxAttrFloats([1.0])) == OnnxAttrKindFloats)
+    test.assert(onnxattr.kind_of(OnnxAttrInts([1])) == OnnxAttrKindInts)
+    test.assert(onnxattr.kind_of(OnnxAttrStrings(["a"])) == OnnxAttrKindStrings)
+    test.assert(onnxattr.kind_of(OnnxAttrTensors([t])) == OnnxAttrKindTensors)
+    test.assert(onnxattr.kind_of(OnnxAttrGraphs([1])) == OnnxAttrKindGraphs)
+    test.assert(onnxattr.kind_of(OnnxAttrRaw(OnnxAttrKindSparseTensor, bytes.zeros(0)))
+        == OnnxAttrKindSparseTensor)
+
+@test
+fn test_every_refusal_names_itself() [io]
+    // A refusal is the package's user interface in the worst moment of
+    // its use.  The code is what a log or a metric keys on, the offset
+    // is what a hex dump needs, and the sentence is what the person
+    // reading it has.  All three are pinned here for every arm.
+    test.case("the stable codes")
+    test.assert_eq_str(onnxfault.code(OnnxNoGraph), "no_graph")
+    test.assert_eq_str(onnxfault.code(OnnxWrongWireType(4, 7, 5, 0)), "wrong_wire_type")
+    test.assert_eq_str(onnxfault.code(OnnxIrVersionTooNew(11, 10)), "ir_version_too_new")
+    test.assert_eq_str(onnxfault.code(OnnxUnknownDataType(99)), "unknown_data_type")
+    test.assert_eq_str(onnxfault.code(OnnxTensorSizeMismatch("w", 3, 4)), "tensor_size_mismatch")
+    test.assert_eq_str(onnxfault.code(OnnxExternalData("w", "m.data")), "external_data")
+    test.assert_eq_str(onnxfault.code(OnnxGraphHasCycle(2, "n")), "graph_has_cycle")
+    test.assert_eq_str(onnxfault.code(OnnxBadUtf8(2, 5)), "bad_utf8")
+    test.assert_eq_str(onnxfault.code(OnnxTooDeep(24)), "too_deep")
+    test.assert_eq_str(onnxfault.code(OnnxTooLarge(11, 10)), "too_large")
+    test.assert_eq_str(onnxfault.code(OnnxAttributeTypeMismatch("n", "a", "INT", "STRING")),
+        "attribute_type_mismatch")
+    test.assert_eq_str(onnxfault.code(OnnxNoOpsetImport), "no_opset_import")
+
+    test.case("the sentences, each naming what was found and where")
+    test.assert_eq_str(OnnxNoGraph.message(), "the model has no graph")
+    test.assert_eq_str(OnnxWrongWireType(4, 7, 5, 0).message(),
+        "field 7 at byte 4 has wire type 5, not 0")
+    test.assert_eq_str(OnnxIrVersionTooNew(11, 10).message(),
+        "ir_version 11 is newer than the 10 this package understands")
+    test.assert_eq_str(OnnxUnknownDataType(99).message(),
+        "tensor data type 99 is not one of the data types this package models")
+    test.assert_eq_str(OnnxTensorSizeMismatch("w", 3, 4).message(),
+        "tensor 'w': 3 byte(s) of data, but its dimensions and element type imply 4")
+    test.assert_eq_str(OnnxExternalData("w", "m.data").message(),
+        "tensor 'w' has its data in 'm.data', which this package cannot open")
+    test.assert_eq_str(OnnxGraphHasCycle(2, "n").message(),
+        "node 2 ('n') closes a cycle in the graph")
+    test.assert_eq_str(OnnxBadUtf8(2, 5).message(), "field 5 at byte 2 is not UTF-8")
+    test.assert_eq_str(OnnxTooDeep(24).message(),
+        "the message nests deeper than the limit of 24")
+    test.assert_eq_str(OnnxTooLarge(11, 10).message(),
+        "the model is 11 byte(s), above the limit of 10")
+    test.assert_eq_str(OnnxAttributeTypeMismatch("n", "a", "INT", "STRING").message(),
+        "attribute 'a' of node 'n' is declared INT and holds STRING")
+    test.assert_eq_str(OnnxNoOpsetImport.message(), "the model imports no operator set")
+
+    test.case("the offset, which three arms carry and the rest answer -1 for")
+    test.assert_eq(onnxfault.offset_of(OnnxWrongWireType(7, 1, 1, 1)), 7)
+    test.assert_eq(onnxfault.offset_of(OnnxBadUtf8(2, 5)), 2)
+    test.assert_eq(onnxfault.offset_of(OnnxNoGraph), 0 - 1)
+    test.assert_eq(onnxfault.offset_of(OnnxTooDeep(4)), 0 - 1)
+
+    test.case("and the one refusal a caller is meant to answer rather than report")
+    test.assert(onnxfault.needs_external_file(OnnxExternalData("w", "m.data")))
+    test.assert(not onnxfault.needs_external_file(OnnxNoGraph))
+    test.assert_eq_str(onnxfault.external_location(OnnxExternalData("w", "m.data")), "m.data")
+    test.assert_eq_str(onnxfault.external_location(OnnxNoGraph), "")
+
+    test.case("the protobuf refusal carries protobuf-nv's own reason")
+    match onnxio.read_header(bytes.from_byte_list([0x00]))
+        Ok(_)                                =>
+            test.fail("a tag of zero names field zero")
+        Err(OnnxNotProtobuf(offset, reason)) =>
+            test.assert_eq(offset, 0)
+            test.assert_eq_str(onnxfault.code(OnnxNotProtobuf(0, reason)), "not_protobuf")
+            let moved = OnnxNotProtobuf(offset: 3, reason: reason)
+            test.assert_eq(onnxfault.offset_of(moved), 3)
+            test.assert_eq_str(moved.message(),
+                "not a protobuf message at byte 3: ${reason.message()}")
+            test.assert(not onnxfault.needs_external_file(moved))
+        Err(e)                               =>
+            test.fail("the header read refused the wrong way: ${e.message()}")
+
+@test
+fn test_the_checker_reports_each_fault_it_can_name() [io]
+    // Thirteen codes, each from the smallest model that earns it.  A
+    // checker whose arms cannot all be reached is a checker whose
+    // sentences have never been read.
+    test.case("a model from a newer release")
+    let future = model_with_graphs(11, [onnxgraph.opset_import("", 17)],
+        [graph_of([onnxgraph.node("n", "Relu", ["x"], ["y"])])])
+    test.assert_eq_str(message_of(onnxcheck.check(future), "ir_version_too_new"),
+        "ir_version 11 is newer than the 10 this package understands")
+
+    test.case("a model that imports a version the table cannot speak for")
+    let ahead = model_with_graphs(10, [onnxgraph.opset_import("", 22)],
+        [graph_of([onnxgraph.node("n", "Relu", ["x"], ["y"])])])
+    test.assert_eq_str(message_of(onnxcheck.check(ahead), "opset_too_new"),
+        "the default operator set is imported at 22, above the 21 the table carries")
+
+    test.case("a model with nodes and no operator set at all")
+    let bare = model_with_graphs(10, [],
+        [graph_of([onnxgraph.node("n", "Relu", ["x"], ["y"])])])
+    let bare_findings = onnxcheck.check(bare)
+    test.assert_eq_str(message_of(bare_findings, "no_opset_import"),
+        "the model has nodes and imports no version of the default operator set")
+    test.assert_eq_str(message_of(bare_findings, "op_not_in_opset"),
+        "'Relu' in domain '' is not an operator the table knows at version -1")
+
+    test.case("a node in a domain the model never imported")
+    let custom = graph_of([OnnxNode { name: "mine", op_type: "MyOp", domain: "com.example",
+        input: [], output: [], attribute: [], doc: "" }])
+    let custom_nodes = custom.node
+    test.assert_eq_str(message_of(findings_of(custom_nodes), "op_not_in_opset"),
+        "'MyOp' in domain 'com.example' is not an operator the table knows at version -1")
+
+    test.case("nodes in the wrong order")
+    let unsorted = graph_of([onnxgraph.node("b", "Relu", ["y"], ["z"]),
+                             onnxgraph.node("a", "Relu", ["x"], ["y"])])
+    let unsorted_nodes = unsorted.node
+    test.assert_eq_str(message_of(findings_of(unsorted_nodes), "unsorted_nodes"),
+        "the graph's nodes are not in topological order")
+
+    test.case("an initializer whose data does not fill its shape")
+    let short = model_with(onnxtype.tensor("W", OnnxFloat, [2], bytes.zeros(4)))
+    test.assert_eq_str(message_of(onnxcheck.check(short), "tensor_size_mismatch"),
+        "initializer 'W' holds 4 byte(s) and its dimensions and element type imply 8")
+
+    test.case("a nameless node, and a name nothing produces")
+    let loose = findings_of([onnxgraph.node("", "Relu", ["nope"], ["y"])])
+    test.assert_eq_str(message_of(loose, "unnamed_node"), "the node has no name")
+    test.assert_eq_str(message_of(loose, "dangling_input"),
+        "the input 'nope' is not a graph input, an initializer, or the output of any node")
+
+    test.case("an attribute whose declaration and value disagree")
+    let liar = graph_of([onnxgraph.with_attribute(onnxgraph.node("n", "Relu", ["x"], ["y"]),
+        OnnxAttribute { name: "axis", declared: OnnxAttrKindInt,
+                        value: OnnxAttrString("one"), ref_name: "" })])
+    let liar_nodes = liar.node
+    test.assert_eq_str(message_of(findings_of(liar_nodes), "attribute_type_mismatch"),
+        "attribute 'axis' is declared INT and holds STRING")
+
+    test.case("an input count the schema cannot take, spelled three ways")
+    test.assert_eq_str(message_of(findings_of([onnxgraph.node("c", "Concat", [], ["y"])]),
+        "input_arity"),
+        "'Concat' at version 13 takes 1 or more input(s) and this node supplies 0")
+    test.assert_eq_str(message_of(findings_of([onnxgraph.node("c", "Clip", [], ["y"])]),
+        "input_arity"),
+        "'Clip' at version 13 takes 1 to 3 input(s) and this node supplies 0")
+    test.assert_eq_str(message_of(findings_of([onnxgraph.node("r", "Relu", ["x", "y"], ["z"])]),
+        "input_arity"),
+        "'Relu' at version 14 takes 1 input(s) and this node supplies 2")
+
+    test.case("an output count a variadic schema takes, and one it does not")
+    let split = findings_of([onnxgraph.node("s", "Split", ["x"], [])])
+    test.assert_eq_str(message_of(split, "output_arity"),
+        "'Split' at version 13 answers 1 or more output(s) and this node has 0")
+    let split3 = findings_of([onnxgraph.node("s", "Split", ["x"], ["a", "b", "c"])])
+    test.assert_eq_str(message_of(split3, "output_arity"), "")
+
+    test.case("an attribute the operator does not take")
+    let bogus = graph_of([onnxgraph.with_attribute(onnxgraph.node("r", "Relu", ["x"], ["y"]),
+        onnxattr.int_attr("bogus", 1))])
+    let bogus_nodes = bogus.node
+    test.assert_eq_str(message_of(findings_of(bogus_nodes), "attribute_not_accepted"),
+        "'Relu' at version 14 takes no attribute 'bogus'")
+
+    test.case("a required attribute that is missing, and the same one supplied")
+    let uncast = findings_of([onnxgraph.node("c", "Cast", ["x"], ["y"])])
+    test.assert_eq_str(message_of(uncast, "missing_attribute"),
+        "'Cast' at version 13 requires the attribute 'to'")
+    let cast = graph_of([onnxgraph.with_attribute(onnxgraph.node("c", "Cast", ["x"], ["y"]),
+        onnxattr.int_attr("to", 7))])
+    let cast_nodes = cast.node
+    test.assert_eq_str(message_of(findings_of(cast_nodes), "missing_attribute"), "")
+
+    test.case("an operator the specification has deprecated")
+    let up = findings_of([onnxgraph.node("u", "Upsample", ["x", "s"], ["y"])])
+    test.assert_eq_str(message_of(up, "deprecated_operator"),
+        "'Upsample' at version 10 is deprecated")
+
+@test
+fn test_the_checker_renders_its_findings_and_answers_the_one_line_questions() [io]
+    // The rendering is what a person reads, so it is asserted line by
+    // line: a finding with a node name, one without, and one about the
+    // model rather than a node.
+    let m = model_with_graphs(11, [onnxgraph.opset_import("", 22)],
+        [graph_of([onnxgraph.node("", "Relu", ["nope"], ["y"]),
+                   onnxgraph.node("n1", "Relu", ["nope"], ["z"])])])
+    let found = onnxcheck.check(m)
+
+    test.case("every finding, in the order the checker found them")
+    let lines = onnxcheck.format(found)
+    test.assert_eq(list.len(lines), 5)
+    test.assert_eq_str(list.get(lines, 0),
+        "warning: ir_version_too_new: model: ir_version 11 is newer than the 10 this package understands")
+    test.assert_eq_str(list.get(lines, 1),
+        "warning: opset_too_new: model: the default operator set is imported at 22, above the 21 the table carries")
+    test.assert_eq_str(list.get(lines, 2),
+        "note: unnamed_node: graph 0 node 0: the node has no name")
+    test.assert_eq_str(list.get(lines, 3),
+        "error: dangling_input: graph 0 node 0: the input 'nope' is not a graph input, an initializer, or the output of any node")
+    test.assert_eq_str(list.get(lines, 4),
+        "error: dangling_input: graph 0 node 1 ('n1'): the input 'nope' is not a graph input, an initializer, or the output of any node")
+
+    test.case("a severity filter, from each of the three levels")
+    test.assert_eq(list.len(onnxcheck.at_least(found, OnnxError)), 2)
+    test.assert_eq(list.len(onnxcheck.at_least(found, OnnxWarning)), 4)
+    test.assert_eq(list.len(onnxcheck.at_least(found, OnnxNote)), 5)
+    test.assert(onnxcheck.has_errors(found))
+
+    test.case("the findings for one node")
+    let one = onnxcheck.for_node(found, 0, 1)
+    test.assert_eq(list.len(one), 1)
+    test.assert_eq_str(list.get(one, 0).node_name, "n1")
+
+    test.case("what a caller asks before it loads anything")
+    test.assert_eq(list.len(onnxcheck.unknown_operators(m)), 0)
+    test.assert(onnxcheck.operators_are_known(m))
+    let unknown = graph_of([onnxgraph.node("k", "Relu", ["x"], ["y"]),
+                            onnxgraph.node("u", "NoSuchOp", ["x"], ["y"]),
+                            OnnxNode { name: "c", op_type: "MyOp", domain: "com.example",
+                                       input: [], output: [], attribute: [], doc: "" },
+                            OnnxNode { name: "c2", op_type: "MyOp", domain: "com.example",
+                                       input: [], output: [], attribute: [], doc: "" }])
+    let ops = onnxcheck.unknown_operators(model_of(unknown))
+    test.assert_eq(list.len(ops), 2)
+    test.assert_eq_str(list.get(ops, 0).0, "")
+    test.assert_eq_str(list.get(ops, 0).1, "NoSuchOp")
+    test.assert_eq_str(list.get(ops, 1).0, "com.example")
+    test.assert_eq_str(list.get(ops, 1).1, "MyOp")
+
+    test.case("a finding about a graph rather than a node names the graph")
+    // The third shape of `where`: a finding with a graph index and no
+    // node index is about the node list itself, and the line says which
+    // graph's list rather than inventing a node for it.
+    let unsorted = model_of(graph_of([onnxgraph.node("b", "Relu", ["from_c"], ["y"]),
+                                      onnxgraph.node("c", "Relu", ["in"], ["from_c"])]))
+    let uf = onnxcheck.check(unsorted)
+    test.assert(any_code(uf, "unsorted_nodes"))
+    test.assert_eq_str(list.get(onnxcheck.format(uf), 0),
+        "warning: unsorted_nodes: graph 0: the graph's nodes are not in topological order")
+
+@test
+fn test_a_subgraph_may_use_a_name_the_graph_around_it_produces() [io]
+    // How `If` and `Loop` reach what they close over: the flat table
+    // does not record which graph encloses which, so a subgraph is
+    // allowed the main graph's names.  Without it, every control-flow
+    // model would be reported as full of dangling inputs.
+    let main = OnnxGraph { name: "main",
+        node: [onnxgraph.node("p", "Relu", ["x"], ["mid"])],
+        input: [onnxtype.value_info("x", OnnxFloat, onnxtype.fixed_shape([1]))],
+        output: [], value_info: [], initializer: [], doc: "" }
+    let sub = OnnxGraph { name: "sub",
+        node: [onnxgraph.node("capture", "Relu", ["mid"], ["out"])],
+        input: [], output: [], value_info: [], initializer: [], doc: "" }
+    let m = model_with_graphs(10, [onnxgraph.opset_import("", 17)], [main, sub])
+
+    test.case("the captured name is not reported")
+    test.assert_eq(list.len(onnxcheck.dangling_inputs(m)), 0)
+
+    test.case("while the main graph's own dangling name still is")
+    let bad = OnnxGraph { name: "main",
+        node: [onnxgraph.node("p", "Relu", ["nowhere"], ["mid"])],
+        input: [], output: [], value_info: [], initializer: [], doc: "" }
+    let m2 = model_with_graphs(10, [onnxgraph.opset_import("", 17)], [bad, sub])
+    test.assert_eq(list.len(onnxcheck.dangling_inputs(m2)), 1)
+    test.assert_eq_str(list.get(onnxcheck.dangling_inputs(m2), 0), "nowhere")
+
+    test.case("and a subgraph's own dangling name is not saved by the capture rule")
+    let leaky = OnnxGraph { name: "sub",
+        node: [onnxgraph.node("capture", "Relu", ["elsewhere"], ["out"])],
+        input: [], output: [], value_info: [], initializer: [], doc: "" }
+    let m3 = model_with_graphs(10, [onnxgraph.opset_import("", 17)], [main, leaky])
+    test.assert_eq(list.len(onnxcheck.dangling_inputs(m3)), 1)
+    test.assert_eq_str(list.get(onnxcheck.dangling_inputs(m3), 0), "elsewhere")
+
+@test
+fn test_the_graph_questions_a_tool_asks() [io]
+    // The small lookups a converter is built out of.  Each has an
+    // empty-name rule and a precedence rule that a plausible
+    // implementation gets wrong: a graph input is not an initializer
+    // even when an older exporter listed it among them, and "" is a
+    // position rather than a value.
+    let w = onnxtype.tensor("W", OnnxFloat, [2], bytes.zeros(8))
+    let s = OnnxTensor { name: "S", data_type: OnnxString, dims: [2], raw: bytes.zeros(0),
+                         strings: ["ab", "cde"], external_location: "" }
+    let g = OnnxGraph { name: "g",
+        node: [onnxgraph.node("a", "Relu", ["x", ""], ["y"]),
+               onnxgraph.node("b", "Relu", ["y"], ["z"])],
+        input: [onnxtype.value_info("x", OnnxFloat, onnxtype.fixed_shape([1])),
+                onnxtype.value_info("W", OnnxFloat, onnxtype.fixed_shape([2]))],
+        output: [onnxtype.value_info("z", OnnxFloat, onnxtype.fixed_shape([1]))],
+        value_info: [onnxtype.value_info("y", OnnxFloat, onnxtype.shape([OnnxDimUnknown]))],
+        initializer: [w], doc: "" }
+
+    test.case("who produces a name, and who consumes it")
+    match onnxgraph.producer_of(g, "y")
+        Some(p) => test.assert_eq_str(p.name, "a")
+        None    => test.fail("node a produces y")
+    match onnxgraph.producer_of(g, "")
+        Some(_) => test.fail("nothing produces the omitted-input marker")
+        None    => ()
+    match onnxgraph.producer_of(g, "x")
+        Some(_) => test.fail("a graph input is produced by nothing")
+        None    => ()
+    let users = onnxgraph.consumers_of(g, "y")
+    test.assert_eq(list.len(users), 1)
+    test.assert_eq(list.get(users, 0), 1)
+    test.assert_eq(list.len(onnxgraph.consumers_of(g, "")), 0)
+
+    test.case("the weights, by name and by size")
+    match onnxgraph.initializer_of(g, "W")
+        Some(t) => test.assert_eq_str(t.name, "W")
+        None    => test.fail("W is an initializer")
+    match onnxgraph.initializer_of(g, "S")
+        Some(_) => test.fail("S is not an initializer")
+        None    => ()
+    let m = model_of(OnnxGraph { name: "g", node: [], input: [], output: [], value_info: [],
+                                 initializer: [w, s], doc: "" })
+    test.assert_eq(onnxgraph.weight_bytes(m), 13)
+
+    test.case("the declared type of a name, wherever it is declared")
+    match onnxgraph.type_of(g, "x")
+        Some(v) => test.assert_eq_str(v.name, "x")
+        None    => test.fail("x is an input")
+    match onnxgraph.type_of(g, "z")
+        Some(v) => test.assert_eq_str(v.name, "z")
+        None    => test.fail("z is an output")
+    match onnxgraph.type_of(g, "y")
+        Some(v) => test.assert_eq_str(v.name, "y")
+        None    => test.fail("y is in value_info")
+    match onnxgraph.type_of(g, "nope")
+        Some(_) => test.fail("nothing declares nope")
+        None    => ()
+
+    test.case("the inputs that are not weights, which is the pre-IR-4 shape")
+    let real = onnxgraph.true_inputs(g)
+    test.assert_eq(list.len(real), 1)
+    test.assert_eq_str(list.get(real, 0).name, "x")
+
+    test.case("every operator the model uses, once each")
+    let two = model_of(graph_of([onnxgraph.node("a", "Relu", ["x"], ["y"]),
+                                 onnxgraph.node("b", "Relu", ["y"], ["z"]),
+                                 onnxgraph.node("c", "Conv", ["z"], ["w"])]))
+    let ops = onnxgraph.operators_used(two)
+    test.assert_eq(list.len(ops), 2)
+    test.assert_eq_str(list.get(ops, 0).0, "")
+    test.assert_eq_str(list.get(ops, 0).1, "Relu")
+    test.assert_eq_str(list.get(ops, 1).1, "Conv")
+
+    test.case("replacing an attribute keeps its place in the file's order")
+    let n = onnxgraph.with_attribute(onnxgraph.node("m", "Relu", ["x"], ["y"]),
+        onnxattr.int_attr("a", 1))
+    let n2 = onnxgraph.with_attribute(n, onnxattr.float_attr("b", 1.0))
+    let n3 = onnxgraph.with_attribute(n2, onnxattr.int_attr("a", 2))
+    test.assert_eq(list.len(n3.attribute), 2)
+    let a0 = list.get(n3.attribute, 0)
+    let a1 = list.get(n3.attribute, 1)
+    test.assert_eq_str(a0.name, "a")
+    test.assert_eq_str(a1.name, "b")
+    match onnxattr.as_int(a0)
+        Some(v) => test.assert_eq(v, 2)
+        None    => test.fail("the replacement is the new value")
+    match onnxattr.as_float(a1)
+        Some(v) => test.assert(v == 1.0)
+        None    => test.fail("b is a float")
+
+    test.case("the subgraphs a node's attributes name")
+    let if_node = OnnxNode { name: "if", op_type: "If", domain: "", input: ["c"],
+        output: ["y"],
+        attribute: [OnnxAttribute { name: "then_branch", declared: OnnxAttrKindGraph,
+                                    value: OnnxAttrGraph(1), ref_name: "" },
+                    OnnxAttribute { name: "else_branch", declared: OnnxAttrKindGraph,
+                                    value: OnnxAttrGraph(2), ref_name: "" }],
+        doc: "" }
+    let indices = onnxgraph.walk_subgraphs(if_node)
+    test.assert_eq(list.len(indices), 2)
+    test.assert_eq(list.get(indices, 0), 1)
+    test.assert_eq(list.get(indices, 1), 2)
+    test.assert_eq(list.len(onnxgraph.walk_subgraphs(onnxgraph.node("r", "Relu", ["x"], ["y"]))), 0)
+
+    test.case("the order a graph's nodes can be run in, in both shapes")
+    let ordered = onnxgraph.topological_order(g)
+    match ordered
+        Ok(order) =>
+            test.assert_eq(list.len(order), 2)
+            test.assert_eq(list.get(order, 0), 0)
+            test.assert_eq(list.get(order, 1), 1)
+        Err(e)    => test.fail("this graph is in order: ${e.message()}")
+    let backward = graph_of([onnxgraph.node("b", "Relu", ["y"], ["z"]),
+                             onnxgraph.node("a", "Relu", ["x"], ["y"])])
+    match onnxgraph.topological_order(backward)
+        Ok(order) =>
+            test.assert_eq(list.len(order), 2)
+            test.assert_eq(list.get(order, 0), 1)
+            test.assert_eq(list.get(order, 1), 0)
+        Err(e)    => test.fail("a graph in the wrong order is not a cycle: ${e.message()}")
+
+    test.case("the arity a schema answers, and the version it changed at")
+    match onnxopset.schema_for("", "Split", 17)
+        Some(s) =>
+            test.assert(onnxopset.accepts_inputs(s, 1))
+            test.assert(onnxopset.accepts_outputs(s, 3))
+        None    => core.panic.panic("onnx_edge_tests: Split is in the table at 17")
+    match onnxopset.schema_for("", "Relu", 17)
+        Some(s) => test.assert(not onnxopset.accepts_outputs(s, 0))
+        None    => core.panic.panic("onnx_edge_tests: Relu is in the table at 17")
+    match onnxopset.last_change_before("", "NoSuchOperator", 17)
+        Some(_) => test.fail("the table does not know that operator")
+        None    => ()
+    match onnxopset.last_change_before("", "Squeeze", 17)
+        Some(v) => test.assert_eq(v, 13)
+        None    => test.fail("Squeeze changed at 13")
+
+// ── What the file carries at every level ────────────────────────────
+//
+// The reader and the writer are two halves of one claim: whatever a
+// file says about a model comes back after a round trip.  The fields
+// that are easy to drop are the ones nothing else depends on — a doc
+// string, a node's domain, a declared shape — and they are exactly what
+// a person opens a model to read.
+
+@test
+fn test_a_model_carries_its_docs_domains_and_declared_values() [io]
+    let n = OnnxNode { name: "ml", op_type: "MyMlOp", domain: "ai.onnx.ml",
+                       input: ["x"], output: ["y"],
+                       attribute: [onnxattr.int_attr("a", 1)], doc: "the node" }
+    let g = OnnxGraph { name: "g", node: [n],
+        input: [OnnxValueInfo { name: "x", elem_type: OnnxFloat,
+                                shape: onnxtype.fixed_shape([1, 2]), doc: "the input" }],
+        output: [OnnxValueInfo { name: "y", elem_type: OnnxFloat,
+                                 shape: onnxtype.fixed_shape([1, 2]), doc: "" }],
+        value_info: [OnnxValueInfo { name: "mid", elem_type: OnnxFloat,
+                                     shape: onnxtype.shape([OnnxDimParam("batch")]),
+                                     doc: "the middle" }],
+        initializer: [], doc: "the graph" }
+    let m = OnnxModel { ir_version: 10,
+        opset_import: [onnxgraph.opset_import("", 17), onnxgraph.opset_import("ai.onnx.ml", 3)],
+        producer_name: "onnx-nv tests", producer_version: "1.2.3", domain: "com.example",
+        model_version: 7, doc: "the model", main: 0, graphs: [g],
+        unknown: onnxgraph.empty_model().unknown }
+
+    test.case("the model's own fields, and every import with its domain")
+    let back = round_trip(m)
+    test.assert_eq_str(back.domain, "com.example")
+    test.assert_eq_str(back.doc, "the model")
+    test.assert_eq(back.model_version, 7)
+    test.assert_eq_str(back.producer_version, "1.2.3")
+    test.assert_eq(list.len(back.opset_import), 2)
+    let imp = list.get(back.opset_import, 1)
+    test.assert_eq_str(imp.domain, "ai.onnx.ml")
+    test.assert_eq(imp.version, 3)
+
+    test.case("the graph's doc, the node's doc and domain, the declared values")
+    let gb = onnxgraph.main_graph(back)
+    test.assert_eq_str(gb.doc, "the graph")
+    let nb = list.get(gb.node, 0)
+    test.assert_eq_str(nb.doc, "the node")
+    test.assert_eq_str(nb.domain, "ai.onnx.ml")
+    test.assert_eq(list.len(gb.input), 1)
+    test.assert_eq_str(list.get(gb.input, 0).doc, "the input")
+    test.assert_eq(list.len(gb.value_info), 1)
+    let vb = list.get(gb.value_info, 0)
+    test.assert_eq_str(vb.name, "mid")
+    test.assert_eq_str(vb.doc, "the middle")
+    test.assert_eq(onnxtype.rank(vb.shape), 1)
+    test.assert_eq_str(onnxtype.dim_text(list.get(vb.shape.dims, 0)), "batch")
+
+@test
+fn test_a_repeated_field_is_read_in_every_spelling_the_wire_allows() [io]
+    // A protobuf parser must accept either encoding of a repeated
+    // field, and ONNX's own exporters use both: `dims` unpacked as the
+    // proto declares it, `int32_data` packed, `float_data` either way.
+    // A reader that took only the declared one would refuse conforming
+    // files, and one that took a fixed32 field for a varint would walk
+    // off the field.
+    test.case("float_data as one fixed32 field per element")
+    let one_float = model_with_initializer(sf(8, "T") + vf(2, 1) + vf(1, 1)
+        + key(4, 5) + bytes.from_byte_list([0x00, 0x00, 0x80, 0x3F]))
+    let t1 = list.get(onnxgraph.main_graph(read_ok(one_float)).initializer, 0)
+    test.assert_eq_str(bytes.to_hex(t1.raw), "0000803f")
+
+    test.case("double_data as one fixed64 field per element")
+    let one_double = model_with_initializer(sf(8, "T") + vf(2, 11) + vf(1, 1)
+        + key(10, 1) + bytes.from_byte_list([0, 0, 0, 0, 0, 0, 0xF8, 0x3F]))
+    let t2 = list.get(onnxgraph.main_graph(read_ok(one_double)).initializer, 0)
+    test.assert_eq_str(bytes.to_hex(t2.raw), "000000000000f83f")
+
+    test.case("and both again as one packed field of two elements")
+    let packed_floats = model_with_initializer(sf(8, "T") + vf(2, 1) + vf(1, 2)
+        + ld(4, bytes.from_byte_list([0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x20, 0x40])))
+    let t3 = list.get(onnxgraph.main_graph(read_ok(packed_floats)).initializer, 0)
+    test.assert_eq_str(bytes.to_hex(t3.raw), "0000803f00002040")
+    let packed_doubles = model_with_initializer(sf(8, "T") + vf(2, 11) + vf(1, 2)
+        + ld(10, bytes.from_byte_list([0, 0, 0, 0, 0, 0, 0xF8, 0x3F,
+                                       0, 0, 0, 0, 0, 0, 0x04, 0x40])))
+    let t4 = list.get(onnxgraph.main_graph(read_ok(packed_doubles)).initializer, 0)
+    test.assert_eq_str(bytes.to_hex(t4.raw), "000000000000f83f0000000000000440")
+
+    test.case("an INT32 tensor's numbers are four bytes each, from int32_data")
+    let int32 = model_with_initializer(sf(8, "T") + vf(2, 6) + vf(1, 2)
+        + vf(5, 1) + vf(5, 2))
+    let t5 = list.get(onnxgraph.main_graph(read_ok(int32)).initializer, 0)
+    test.assert_eq_str(bytes.to_hex(t5.raw), "0100000002000000")
+
+    test.case("a repeated field on the wrong wire is refused at its key")
+    let bad_float = model_with_initializer(sf(8, "T") + vf(2, 1) + vf(1, 1) + vf(4, 1))
+    test.assert_eq_str(read_code(bad_float), "wrong_wire_type")
+    match onnxio.read(bad_float, onnxio.default_limits())
+        Ok(_)  => test.fail("a varint is not a float_data element")
+        Err(e) => test.assert_eq_str(e.message(),
+            "field 4 at byte 13 has wire type 0, not 5")
+    let bad_int = model_with_initializer(sf(8, "T") + vf(2, 6) + vf(1, 1)
+        + key(5, 5) + bytes.from_byte_list([1, 0, 0, 0]))
+    test.assert_eq_str(read_code(bad_int), "wrong_wire_type")
+
+@test
+fn test_a_field_the_package_does_not_model_is_stepped_over_at_every_level() [io]
+    // The same claim the model-level test makes, one level down each
+    // time: a newer ONNX adding a field to a shape, a type, an opset or
+    // an attribute must not shift the fields this reader does know.
+    // Each unknown field here sits AFTER the fields that matter, so a
+    // reader that stepped by the wrong length would move the shape.
+    let dim = vf(1, 3) + vf(99, 1)
+    let shape = ld(1, dim) + vf(99, 1)
+    let tensor_type = vf(1, 1) + ld(2, shape) + vf(99, 1)
+    let type_proto = ld(1, tensor_type) + vf(99, 1)
+    let vi = sf(1, "x") + ld(2, type_proto) + vf(99, 1)
+    let graph = sf(2, "g") + ld(11, vi) + vf(99, 1)
+    let file = vf(1, 10) + ld(8, vf(2, 17) + vf(99, 1)) + ld(7, graph)
+
+    let m = read_ok(file)
+    test.case("the shape survived every unknown field above it")
+    let g = onnxgraph.main_graph(m)
+    test.assert_eq(list.len(g.input), 1)
+    let x = list.get(g.input, 0)
+    test.assert_eq_str(x.name, "x")
+    test.assert(x.elem_type == OnnxFloat)
+    test.assert_eq(onnxtype.rank(x.shape), 1)
+    test.assert_eq_str(onnxtype.dim_text(list.get(x.shape.dims, 0)), "3")
+
+    test.case("and so did the opset import the file carried it inside")
+    test.assert_eq(list.len(m.opset_import), 1)
+    test.assert_eq(list.get(m.opset_import, 0).version, 17)
+
+@test
+fn test_a_structure_only_read_keeps_the_shape_and_drops_the_data() [io]
+    // What a tool that walks a graph and never looks at a weight asks
+    // for: the tensor's name, its shape and its element type come back,
+    // and the numbers do not — whichever of the five fields they were
+    // in.  It is also what makes an external tensor readable at all.
+    let limits = onnxio.structure_only()
+
+    test.case("a string tensor's elements are not collected")
+    let strings = model_with_initializer(sf(8, "S") + vf(2, 8) + vf(1, 2)
+        + sf(6, "ab") + sf(6, "cde"))
+    let t1 = list.get(onnxgraph.main_graph(read_limits(strings, limits)).initializer, 0)
+    test.assert_eq_str(t1.name, "S")
+    test.assert_eq(list.len(t1.dims), 1)
+    test.assert_eq(list.len(t1.strings), 0)
+
+    test.case("nor are the reals in float_data or the numbers in int32_data")
+    let reals = model_with_initializer(sf(8, "F") + vf(2, 1) + vf(1, 1)
+        + ld(4, bytes.from_byte_list([0x00, 0x00, 0x80, 0x3F])))
+    let t2 = list.get(onnxgraph.main_graph(read_limits(reals, limits)).initializer, 0)
+    test.assert_eq(bytes.len(t2.raw), 0)
+    test.assert(t2.data_type == OnnxFloat)
+    let ints = model_with_initializer(sf(8, "I") + vf(2, 6) + vf(1, 2)
+        + ld(5, bytes.from_byte_list([1, 0, 0, 0, 2, 0, 0, 0])))
+    let t3 = list.get(onnxgraph.main_graph(read_limits(ints, limits)).initializer, 0)
+    test.assert_eq(bytes.len(t3.raw), 0)
+    test.assert(t3.data_type == OnnxInt32)
+
+    test.case("and a tensor whose data is a file keeps its location, with no read of it")
+    let ext = model_with_initializer(sf(8, "E") + vf(2, 1) + vf(1, 1)
+        + ld(13, sf(1, "offset") + sf(2, "8") + vf(99, 1))
+        + ld(13, sf(1, "location") + sf(2, "model.data")))
+    let t4 = list.get(onnxgraph.main_graph(read_limits(ext, limits)).initializer, 0)
+    test.assert(onnxtype.is_external(t4))
+    test.assert_eq_str(t4.external_location, "model.data")
+    test.assert_eq_str(read_code(ext), "external_data")
+
+@test
+fn test_a_depth_limit_is_checked_at_every_message_it_guards() [io]
+    // The depth ceiling is the bound against a crafted file: protobuf
+    // nesting is unbounded and a recursive reader is a stack overflow
+    // waiting for one.  Each message that can hold another checks it,
+    // and the refusals name the limit that was set.
+    let node = sf(4, "Relu") + ld(5, sf(1, "a") + vf(20, 2) + vf(3, 1))
+    let file = vf(1, 10) + ld(7, ld(1, node))
+
+    test.case("an attribute is a level below its node")
+    match onnxio.read(file, onnxio.with_max_depth(onnxio.default_limits(), 2))
+        Ok(_)  => test.fail("the node's attribute is at depth 3")
+        Err(e) => test.assert_eq_str(onnxfault.code(e), "too_deep")
+
+    test.case("and a limit below zero is refused before a byte is read")
+    match onnxio.read(file, onnxio.with_max_depth(onnxio.default_limits(), 0 - 1))
+        Ok(_)  => test.fail("no model nests less deeply than -1")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "too_deep")
+            test.assert_eq_str(e.message(), "the message nests deeper than the limit of -1")
+
+// The model a read at hand-picked limits answered.
+fn read_limits(src: Bytes, limits: OnnxReadLimits) -> OnnxModel [io]
+    match onnxio.read(src, limits)
+        Ok(m)  => m
+        Err(_) =>
+            core.panic.panic("onnx_edge_tests: the reader refused a file it should read")
+
+@test
+fn test_an_attributes_value_shapes_are_read_and_written_back() [io]
+    // `AttributeProto` has twelve value fields and a `ref_attr_name`
+    // beside them; a reader that modelled only the list forms would
+    // drop a `t` or an `f` from every model that has one, and one that
+    // resolved a `ref_attr_name` to a value would rewrite a function's
+    // parameter into a constant.
+    let a0 = sf(1, "a0") + sf(13, "attr doc") + vf(20, 2) + vf(3, 5) + sf(21, "p")
+    let a1 = sf(1, "a1") + vf(20, 1) + key(2, 5) + bytes.from_byte_list([0x00, 0x00, 0x20, 0x40])
+    let a2 = sf(1, "a2") + vf(20, 4)
+        + ld(5, vf(1, 1) + vf(2, 1) + ld(9, bytes.from_byte_list([0, 0, 0x80, 0x3F])))
+    let a3 = sf(1, "a3")
+    let a4 = sf(1, "a4") + vf(20, 11) + ld(22, vf(1, 7))
+    let a5 = sf(1, "a5") + vf(20, 6) + ld(7, bytes.zeros(0))
+    let a6 = sf(1, "a6") + vf(20, 2) + vf(3, 9) + sf(4, "ignored") + vf(99, 1)
+    let node = sf(4, "TestOp") + ld(5, a0) + ld(5, a1) + ld(5, a2) + ld(5, a3)
+        + ld(5, a4) + ld(5, a5) + ld(5, a6)
+    let file = vf(1, 10) + ld(8, vf(2, 17)) + ld(7, ld(1, node))
+
+    let m = read_ok(file)
+    // The node is bound before its attribute list is read, the same
+    // way every other test here reads one.
+    let n0 = list.get(onnxgraph.main_graph(m).node, 0)
+    let attrs = n0.attribute
+    test.assert_eq(list.len(attrs), 7)
+
+    test.case("a value with a reference beside it keeps both")
+    let x0 = list.get(attrs, 0)
+    test.assert_eq_str(x0.ref_name, "p")
+    test.assert(x0.declared == OnnxAttrKindInt)
+    match onnxattr.as_int(x0)
+        Some(v) => test.assert_eq(v, 5)
+        None    => test.fail("a0 is an integer")
+
+    test.case("a single float, and a single tensor")
+    match onnxattr.as_float(list.get(attrs, 1))
+        Some(v) => test.assert(v == 2.5)
+        None    => test.fail("a1 is a float")
+    match onnxattr.as_tensor(list.get(attrs, 2))
+        Some(t) => test.assert_eq_str(bytes.to_hex(t.raw), "0000803f")
+        None    => test.fail("a2 is a tensor")
+
+    test.case("an attribute with no value at all, and a kind kept as its bytes")
+    test.assert(onnxattr.kind_of(list.get(attrs, 3).value) == OnnxAttrKindUndefined)
+    test.assert(onnxattr.kind_of(list.get(attrs, 4).value) == OnnxAttrKindSparseTensor)
+
+    test.case("an empty FLOATS is still a FLOATS")
+    test.assert(onnxattr.kind_of(list.get(attrs, 5).value) == OnnxAttrKindFloats)
+    match list.get(attrs, 5).value
+        OnnxAttrFloats(xs) => test.assert_eq(list.len(xs), 0)
+        _                  => test.fail("a5 is a list of floats, empty")
+
+    test.case("a second value field in one attribute is stepped over, in field order")
+    match onnxattr.as_int(list.get(attrs, 6))
+        Some(v) => test.assert_eq(v, 9)
+        None    => test.fail("a6's first value field is the integer")
+    test.case("and all seven survive a round trip")
+    let back = round_trip(m)
+    let nb = list.get(onnxgraph.main_graph(back).node, 0)
+    let ab = nb.attribute
+    test.assert_eq(list.len(ab), 7)
+    test.assert_eq_str(list.get(ab, 0).ref_name, "p")
+    match onnxattr.as_float(list.get(ab, 1))
+        Some(v) => test.assert(v == 2.5)
+        None    => test.fail("a1 came back as a float")
+    test.assert(onnxattr.kind_of(list.get(ab, 2).value) == OnnxAttrKindTensor)
+    test.assert(onnxattr.kind_of(list.get(ab, 3).value) == OnnxAttrKindUndefined)
+    test.assert(onnxattr.kind_of(list.get(ab, 4).value) == OnnxAttrKindSparseTensor)
+    test.assert(onnxattr.kind_of(list.get(ab, 5).value) == OnnxAttrKindFloats)
+    match onnxattr.as_int(list.get(ab, 6))
+        Some(v) => test.assert_eq(v, 9)
+        None    => test.fail("a6 came back as an integer")
+
+    test.case("a reference and an undeclared kind are both writable as they stand")
+    let loose = [OnnxAttribute { name: "r", declared: OnnxAttrKindInt,
+                                 value: OnnxAttrString("not an int"), ref_name: "p" },
+                 OnnxAttribute { name: "u", declared: OnnxAttrKindUndefined,
+                                 value: OnnxAttrInt(1), ref_name: "" }]
+    var n2 = onnxgraph.node("n", "Relu", ["x"], ["y"])
+    for a in loose
+        n2 = onnxgraph.with_attribute(n2, a)
+    match onnxio.write(model_of(graph_of([n2])))
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(e) => test.fail("neither attribute is the writer's business: ${e.message()}")
+
+    test.case("a string tensor's bytes come back exactly as the file held them")
+    // ONNX says its strings are UTF-8 and this reader does not check a
+    // TENSOR's string: the bytes are the element, and a write puts them
+    // back byte for byte rather than refusing a file it can carry.
+    let raw_string = model_with_initializer(sf(8, "S") + vf(2, 8) + vf(1, 1)
+        + ld(6, bytes.from_byte_list([0xFF, 0xFE])))
+    let sm = read_ok(raw_string)
+    let st = list.get(onnxgraph.main_graph(sm).initializer, 0)
+    test.assert_eq(list.len(st.strings), 1)
+    let again = read_ok(written(sm))
+    let st2 = list.get(onnxgraph.main_graph(again).initializer, 0)
+    test.assert_eq(list.len(st2.strings), 1)
+    test.assert_eq_str(bytes.to_hex(bytes.from_str(list.get(st2.strings, 0))), "fffe")
+
+    test.case("while a message's own text field that is not UTF-8 is refused")   // A node's name, a doc string and an attribute's `s` are protobuf
+    // STRINGS, and a Str that is not UTF-8 would be written as bytes
+    // that no conforming parser can read back — so the writer refuses
+    // it, which is the one place a refusal can still be raised.
+    let bad_attr = sf(1, "s") + vf(20, 3) + ld(4, bytes.from_byte_list([0xFF, 0xFE]))
+    let file = vf(1, 10) + ld(8, vf(2, 17))
+        + ld(7, ld(1, ld(4, bytes.from_str("TestOp")) + ld(5, bad_attr)))
+    let am = read_ok(file)
+    match onnxio.write(am)
+        Ok(_)  => test.fail("0xFF is not UTF-8, and a protobuf string must be")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "bad_utf8")
+            // The offset is inside the value being written and not in
+            // any file: this refusal is raised by the writer, which has
+            // a model and not a byte range to point at.
+            test.assert_eq_str(e.message(), "field 4 at byte 0 is not UTF-8")
+
+    test.case("and a byte string that is neither a message nor a model says so")
+    test.assert(not onnxio.looks_like_onnx(bytes.zeros(0)))
+    test.assert(not onnxio.looks_like_onnx(bytes.from_byte_list([0x00])))
+    test.assert(onnxio.looks_like_onnx(bytes.from_byte_list([0x08, 0x08])))
+
+@test
+fn test_a_floats_attribute_is_read_in_every_spelling_the_wire_allows() [io]
+    // `floats` is the only repeated real an `AttributeProto` has, and a
+    // conforming encoder may write it packed or one element to a field.
+    // The single element is the spelling a reader that assumed the
+    // packed one walks off the end of — the field promises five-byte
+    // keys and four bytes of payload, not a length.
+    let one = key(7, 5) + bytes.from_byte_list([0x00, 0x00, 0x80, 0x3F])
+    let node = ld(4, bytes.from_str("TestOp"))
+        + ld(5, sf(1, "f") + vf(20, 6) + one)
+    let m = read_ok(vf(1, 10) + ld(8, vf(2, 17)) + ld(7, ld(1, node)))
+    let n0 = list.get(onnxgraph.main_graph(m).node, 0)
+    let a = list.get(n0.attribute, 0)
+    match a.value
+        OnnxAttrFloats(xs) =>
+            test.assert_eq(list.len(xs), 1)
+            test.assert(list.get(xs, 0) == 1.0)
+        _                  =>
+            test.fail("an attribute of one float is a FLOATS")
+
+    test.case("and a floats field on the wrong wire is refused at its key")
+    let bad = ld(4, bytes.from_str("TestOp"))
+        + ld(5, sf(1, "f") + vf(20, 6) + key(7, 0) + varint(1))
+    match onnxio.read(vf(1, 10) + ld(8, vf(2, 17)) + ld(7, ld(1, bad)),
+                      onnxio.default_limits())
+        Ok(_)  => test.fail("a varint is not a floats element")
+        Err(e) =>
+            test.assert_eq_str(onnxfault.code(e), "wrong_wire_type")
+            test.assert_eq_str(e.message(), "field 7 at byte 26 has wire type 0, not 5")
