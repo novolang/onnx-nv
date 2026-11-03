@@ -5,11 +5,13 @@ All notable changes to onnx-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
+## 0.1.0 — 2026-11-03
 
 ### Changed
 
 - Internal: the `elif` ladders over a protobuf field number are `match` expressions, and the cycle search holds its node as an optional. No public signature changed.
+
+This release requires novo 0.23.0 or later.
 
 ## 0.1.0 — 2026-10-12
 
@@ -121,6 +123,10 @@ before it shipped.
   text.** The reader refuses bytes that are not UTF-8 in a message's
   text fields, but `bytes.to_str` stops at the first NUL, and a
   `string_data` element is kept raw either way.
+
+## 0.0.4 — 2026-10-25
+
+A file that names a sibling module's type, function or constant now has the `use` line for that module (E2033, E2003).  No signature and no behaviour changed.
 
 ## 0.0.3 — 2026-09-28
 
